@@ -5,7 +5,7 @@ A simplified command-line utility for interacting with the Sublime Security Plat
 ## Installation
 
 ```bash
-pip install sublime-cli
+pip install sublime-migration-cli
 ```
 
 ## Usage
