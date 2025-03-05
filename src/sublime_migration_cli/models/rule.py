@@ -11,6 +11,18 @@ class RuleAction:
     name: str
     active: bool
 
+    def to_dict(self) -> Dict:
+        """Convert the rule action to a dictionary.
+        
+        Returns:
+            Dict: Dictionary representation of the rule action
+        """
+        return {
+            "id": self.id,
+            "name": self.name,
+            "active": self.active
+        }
+
 
 @dataclass
 class Rule:
@@ -114,3 +126,55 @@ class Rule:
             exclusions=exclusions,
             has_exclusions=bool(exclusions)
         )
+    
+    def to_dict(self) -> Dict:
+        """Convert the rule to a dictionary.
+        
+        Returns:
+            Dict: Dictionary representation of the rule
+        """
+        result = {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type,
+            "full_type": self.full_type,
+            "active": self.active,
+            "passive": self.passive,
+            "source": self.source,
+            "severity": self.severity,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+        
+        # Include optional fields if present
+        if self.description:
+            result["description"] = self.description
+        
+        if self.authors:
+            result["authors"] = self.authors
+        
+        if self.references:
+            result["references"] = self.references
+        
+        if self.tags:
+            result["tags"] = self.tags
+        
+        if self.created_by_user_name:
+            result["created_by"] = self.created_by_user_name
+        elif self.created_by_org_name:
+            result["created_by"] = self.created_by_org_name
+        
+        if self.feed_id:
+            result["feed_id"] = self.feed_id
+            
+        if self.feed_external_rule_id:
+            result["feed_external_rule_id"] = self.feed_external_rule_id
+        
+        # Include related objects
+        if self.actions:
+            result["actions"] = [action.to_dict() for action in self.actions]
+        
+        if self.exclusions:
+            result["exclusions"] = self.exclusions
+        
+        return result

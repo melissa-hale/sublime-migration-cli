@@ -1,215 +1,148 @@
-"""Commands for migrating feeds between Sublime Security instances."""
-from typing import Dict, List, Optional
-import json
-
+"""Refactored commands for migrating feeds between Sublime Security instances."""
+from typing import Dict, List, Optional, Set
 import click
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm
-from rich.table import Table
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
+from sublime_migration_cli.presentation.base import CommandResult
+from sublime_migration_cli.presentation.factory import create_formatter
 
 
-@click.command()
-@click.option("--source-api-key", help="API key for the source instance")
-@click.option("--source-region", help="Region of the source instance")
-@click.option("--dest-api-key", help="API key for the destination instance")
-@click.option("--dest-region", help="Region of the destination instance")
-@click.option("--include-ids", help="Comma-separated list of feed IDs to include")
-@click.option("--exclude-ids", help="Comma-separated list of feed IDs to exclude")
-@click.option("--include-system", is_flag=True, help="Include system feeds (by default, only user-created feeds are migrated)")
-@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
-              help="Output format (table or json)")
-def feeds(source_api_key, source_region, dest_api_key, dest_region,
-          include_ids, exclude_ids, include_system, dry_run, yes, output_format):
-    """Migrate feeds between Sublime Security instances.
+# Implementation functions
+def migrate_feeds_between_instances(
+    source_api_key=None, source_region=None, 
+    dest_api_key=None, dest_region=None,
+    include_ids=None, exclude_ids=None, 
+    include_system=False,
+    dry_run=False, formatter=None
+):
+    """Implementation for migrating feeds between instances.
     
-    This command copies feed configurations from the source instance to the destination instance.
-    By default, only user-created feeds are migrated (not those marked as system feeds).
-    
-    Examples:
-        # Migrate all user-created feeds
-        sublime migrate feeds --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Migrate specific feeds by ID
-        sublime migrate feeds --include-ids id1,id2 --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Preview migration without making changes
-        sublime migrate feeds --dry-run --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Include system feeds in migration
-        sublime migrate feeds --include-system --source-api-key KEY1 --dest-api-key KEY2
+    Args:
+        source_api_key: API key for source instance
+        source_region: Region for source instance
+        dest_api_key: API key for destination instance
+        dest_region: Region for destination instance
+        include_ids: Comma-separated list of feed IDs to include
+        exclude_ids: Comma-separated list of feed IDs to exclude
+        include_system: Include system feeds
+        dry_run: If True, preview changes without applying them
+        formatter: Output formatter
     """
-    console = Console()
-    results = {"status": "started", "message": "Migration of Feeds"}
-    
-    if output_format == "table":
-        console.print("[bold]Migration of Feeds[/]")
-    
+    # Default to table formatter if none provided
+    if formatter is None:
+        formatter = create_formatter("table")
+        
     try:
         # Create API clients for source and destination
-        source_client = get_api_client_from_env_or_args(source_api_key, source_region)
-        dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
+        with formatter.create_progress("Connecting to source and destination instances...") as (progress, task):
+            source_client = get_api_client_from_env_or_args(source_api_key, source_region)
+            dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
+            progress.update(task, advance=1)
         
         # Fetch feeds from source
-        if output_format == "table":
-            with console.status("[blue]Fetching feeds from source instance...[/]"):
-                source_response = source_client.get("/v1/feeds")
-        else:
-            source_response = source_client.get("/v1/feeds")
-        
-        # Extract feeds from response
-        if "feeds" in source_response:
-            source_feeds = source_response["feeds"]
-        else:
-            source_feeds = source_response
+        with formatter.create_progress("Fetching feeds from source instance...") as (progress, task):
+            response = source_client.get("/v1/feeds")
+            
+            # The API returns a nested object with a "feeds" key
+            if "feeds" in response:
+                source_feeds = response["feeds"]
+            else:
+                source_feeds = response  # Fallback if structure changes
+                
+            progress.update(task, advance=1)
         
         # Apply filters
         filtered_feeds = filter_feeds(source_feeds, include_ids, exclude_ids, include_system)
         
         if not filtered_feeds:
-            message = "No feeds to migrate after applying filters."
-            if output_format == "table":
-                console.print(f"[yellow]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.error("No feeds to migrate after applying filters.")
             
-        feeds_count_message = f"Found {len(filtered_feeds)} feeds to migrate."
-        if output_format == "table":
-            console.print(f"[bold]{feeds_count_message}[/]")
-        else:
-            results["count"] = len(filtered_feeds)
-            results["message"] = feeds_count_message
-        
         # Fetch feeds from destination for comparison
-        if output_format == "table":
-            with console.status("[blue]Fetching feeds from destination instance...[/]"):
-                dest_response = dest_client.get("/v1/feeds")
-        else:
-            dest_response = dest_client.get("/v1/feeds")
-        
-        # Extract destination feeds
-        if "feeds" in dest_response:
-            dest_feeds = dest_response["feeds"]
-        else:
-            dest_feeds = dest_response
+        with formatter.create_progress("Fetching feeds from destination instance...") as (progress, task):
+            response = dest_client.get("/v1/feeds")
+            
+            if "feeds" in response:
+                dest_feeds = response["feeds"]
+            else:
+                dest_feeds = response
+                
+            progress.update(task, advance=1)
         
         # Compare and categorize feeds
         new_feeds, update_feeds = categorize_feeds(filtered_feeds, dest_feeds)
         
-        # Preview changes
+        # If no feeds to migrate, return early
         if not new_feeds and not update_feeds:
-            message = "All selected feeds already exist in the destination instance."
-            if output_format == "table":
-                console.print(f"[green]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.success("All selected feeds already exist in the destination instance.")
             
-        preview_message = f"\nPreparing to migrate {len(new_feeds)} new feeds and potentially update {len(update_feeds)} existing feeds."
-        if output_format == "table":
-            console.print(f"[bold]{preview_message}[/]")
-        
-            # Display preview table
-            preview_table = Table(title="Feeds to Migrate")
-            preview_table.add_column("ID", style="dim", no_wrap=True)
-            preview_table.add_column("Name", style="green")
-            preview_table.add_column("Git URL", style="blue")
-            preview_table.add_column("Branch", style="cyan")
-            preview_table.add_column("Status", style="magenta")
-            
-            for feed in new_feeds:
-                preview_table.add_row(
-                    feed.get("id", ""),
-                    feed.get("name", ""),
-                    feed.get("git_url", ""),
-                    feed.get("git_branch", ""),
-                    "New"
-                )
-            
-            for feed in update_feeds:
-                preview_table.add_row(
-                    feed.get("id", ""),
-                    feed.get("name", ""),
-                    feed.get("git_url", ""),
-                    feed.get("git_branch", ""),
-                    "Update (if different)"
-                )
-            
-            console.print(preview_table)
-        else:
-            # JSON output
-            results["new_feeds"] = len(new_feeds)
-            results["update_feeds"] = len(update_feeds)
-            results["feeds_to_migrate"] = [
+        # Prepare response data
+        migration_data = {
+            "new_feeds": [
                 {
                     "id": feed.get("id", ""),
                     "name": feed.get("name", ""),
                     "git_url": feed.get("git_url", ""),
                     "git_branch": feed.get("git_branch", ""),
+                    "is_system": feed.get("is_system", False),
                     "status": "New"
                 }
                 for feed in new_feeds
-            ] + [
+            ],
+            "update_feeds": [
                 {
                     "id": feed.get("id", ""),
                     "name": feed.get("name", ""),
                     "git_url": feed.get("git_url", ""),
                     "git_branch": feed.get("git_branch", ""),
+                    "is_system": feed.get("is_system", False),
                     "status": "Update (if different)"
                 }
                 for feed in update_feeds
             ]
+        }
         
-        # If dry run, stop here
+        # Add summary stats
+        migration_data["summary"] = {
+            "new_count": len(new_feeds),
+            "update_count": len(update_feeds),
+            "total_count": len(new_feeds) + len(update_feeds)
+        }
+        
+        # If dry run, return preview data
         if dry_run:
-            dry_run_message = "DRY RUN: No changes were made."
-            if output_format == "table":
-                console.print(f"\n[yellow]{dry_run_message}[/]")
-            else:
-                results["status"] = "dry_run"
-                results["message"] = dry_run_message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.success(
+                "DRY RUN: Preview of feeds to migrate",
+                migration_data,
+                "No changes were made to the destination instance."
+            )
         
-        # Ask for confirmation
-        if not yes and output_format == "table" and not Confirm.ask("\nDo you want to proceed with the migration?"):
-            cancel_message = "Migration canceled by user."
-            console.print(f"[yellow]{cancel_message}[/]")
-            return
+        # Show preview before confirmation in interactive mode
+        formatter.output_result(CommandResult.success(
+            "Feeds that will be migrated:",
+            migration_data,
+            "Please confirm to proceed with migration."
+        ))
         
-        # Perform actual migration
-        migration_results = migrate_feeds(
-            console, dest_client, new_feeds, update_feeds, dest_feeds, output_format
+        # Confirm migration if interactive
+        if not formatter.prompt_confirmation("\nDo you want to proceed with the migration?"):
+            return CommandResult.success("Migration canceled by user.")
+        
+        # Perform the migration
+        results = perform_migration(formatter, dest_client, new_feeds, update_feeds, dest_feeds)
+        
+        # Add results to migration data
+        migration_data["results"] = results
+        
+        # Return overall results
+        return CommandResult.success(
+            f"Migration completed: {results['created']} created, {results['updated']} updated, "
+            f"{results['skipped']} skipped, {results['failed']} failed",
+            migration_data,
+            "See details below for operation results."
         )
         
-        # Display results
-        results_message = f"Migration completed: {migration_results['created']} created, {migration_results['updated']} updated, {migration_results['skipped']} skipped, {migration_results['failed']} failed"
-        
-        if output_format == "table":
-            console.print(f"\n[bold green]{results_message}[/]")
-        else:
-            results["status"] = "completed"
-            results["message"] = results_message
-            results["details"] = migration_results
-            click.echo(json.dumps(results, indent=2))
-        
     except Exception as e:
-        error_message = f"Error during migration: {str(e)}"
-        if output_format == "table":
-            console.print(f"[bold red]{error_message}[/]")
-        else:
-            results["status"] = "error"
-            results["error"] = error_message
-            click.echo(json.dumps(results, indent=2))
+        return CommandResult.error(f"Error during migration: {str(e)}")
 
 
 def filter_feeds(feeds: List[Dict], include_ids: Optional[str], 
@@ -269,21 +202,19 @@ def categorize_feeds(source_feeds: List[Dict], dest_feeds: List[Dict]) -> tuple:
     return new_feeds, update_feeds
 
 
-def migrate_feeds(console: Console, dest_client, new_feeds: List[Dict], 
-                 update_feeds: List[Dict], existing_feeds: List[Dict],
-                 output_format: str) -> Dict:
-    """Migrate feeds to the destination instance.
+def perform_migration(formatter, dest_client, new_feeds: List[Dict], 
+                     update_feeds: List[Dict], existing_feeds: List[Dict]) -> Dict:
+    """Perform the actual migration of feeds to the destination.
     
     Args:
-        console: Rich console for output
-        dest_client: API client for the destination
+        formatter: Output formatter
+        dest_client: API client for destination
         new_feeds: List of new feeds to create
-        update_feeds: List of feeds to potentially update
-        existing_feeds: List of existing feeds in the destination
-        output_format: Output format ("table" or "json")
+        update_feeds: List of feeds to update
+        existing_feeds: List of existing feeds in destination
         
     Returns:
-        Dict: Migration results summary
+        Dict: Results of the migration
     """
     results = {
         "created": 0,
@@ -298,39 +229,17 @@ def migrate_feeds(console: Console, dest_client, new_feeds: List[Dict],
     
     # Process new feeds
     if new_feeds:
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Creating new feeds..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Creating", total=len(new_feeds))
-                
-                for feed in new_feeds:
-                    process_new_feed(feed, dest_client, results)
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode - no progress indicators
+        with formatter.create_progress("Creating new feeds...", total=len(new_feeds)) as (progress, task):
             for feed in new_feeds:
                 process_new_feed(feed, dest_client, results)
+                progress.update(task, advance=1)
     
     # Process updates
     if update_feeds:
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Updating existing feeds..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Updating", total=len(update_feeds))
-                
-                for feed in update_feeds:
-                    process_update_feed(feed, dest_client, existing_map, results, console, output_format)
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode - no progress indicators
+        with formatter.create_progress("Updating existing feeds...", total=len(update_feeds)) as (progress, task):
             for feed in update_feeds:
-                process_update_feed(feed, dest_client, existing_map, results, console, output_format)
+                process_update_feed(feed, dest_client, existing_map, results)
+                progress.update(task, advance=1)
     
     return results
 
@@ -347,6 +256,7 @@ def process_new_feed(feed: Dict, dest_client, results: Dict):
         results["created"] += 1
         results["details"].append({
             "name": feed_name,
+            "type": "feed",
             "status": "created"
         })
         
@@ -354,13 +264,13 @@ def process_new_feed(feed: Dict, dest_client, results: Dict):
         results["failed"] += 1
         results["details"].append({
             "name": feed_name,
+            "type": "feed",
             "status": "failed",
             "reason": str(e)
         })
 
 
-def process_update_feed(feed: Dict, dest_client, existing_map: Dict[str, Dict], 
-                      results: Dict, console: Console, output_format: str):
+def process_update_feed(feed: Dict, dest_client, existing_map: Dict[str, Dict], results: Dict):
     """Process a feed update for migration."""
     feed_name = feed.get("name", "")
     existing = existing_map.get(feed_name)
@@ -369,6 +279,7 @@ def process_update_feed(feed: Dict, dest_client, existing_map: Dict[str, Dict],
         results["skipped"] += 1
         results["details"].append({
             "name": feed_name,
+            "type": "feed",
             "status": "skipped",
             "reason": "Feed not found in destination"
         })
@@ -392,6 +303,7 @@ def process_update_feed(feed: Dict, dest_client, existing_map: Dict[str, Dict],
             results["updated"] += 1
             results["details"].append({
                 "name": feed_name,
+                "type": "feed",
                 "status": "updated",
                 "reason": "Feed configuration changed"
             })
@@ -399,21 +311,19 @@ def process_update_feed(feed: Dict, dest_client, existing_map: Dict[str, Dict],
             results["skipped"] += 1
             results["details"].append({
                 "name": feed_name,
+                "type": "feed",
                 "status": "skipped",
                 "reason": "No changes needed"
             })
                 
     except Exception as e:
-        error_message = f"Failed to update feed '{feed_name}': {str(e)}"
         results["failed"] += 1
         results["details"].append({
             "name": feed_name,
+            "type": "feed",
             "status": "failed",
             "reason": str(e)
         })
-        
-        if output_format == "table":
-            console.print(f"[red]{error_message}[/]")
 
 
 def create_feed_payload(feed: Dict) -> Dict:
@@ -438,3 +348,61 @@ def create_feed_payload(feed: Dict) -> Dict:
     }
     
     return payload
+
+
+# Click command definition
+@click.command()
+@click.option("--source-api-key", help="API key for the source instance")
+@click.option("--source-region", help="Region of the source instance")
+@click.option("--dest-api-key", help="API key for the destination instance")
+@click.option("--dest-region", help="Region of the destination instance")
+@click.option("--include-ids", help="Comma-separated list of feed IDs to include")
+@click.option("--exclude-ids", help="Comma-separated list of feed IDs to exclude")
+@click.option("--include-system", is_flag=True, help="Include system feeds (by default, only user-created feeds are migrated)")
+@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
+              help="Output format (table or json)")
+def feeds(source_api_key, source_region, dest_api_key, dest_region,
+          include_ids, exclude_ids, include_system, dry_run, yes, output_format):
+    """Migrate feeds between Sublime Security instances.
+    
+    This command copies feed configurations from the source instance to the destination instance.
+    By default, only user-created feeds are migrated (not those marked as system feeds).
+    
+    Examples:
+        # Migrate all user-created feeds
+        sublime migrate feeds --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Migrate specific feeds by ID
+        sublime migrate feeds --include-ids id1,id2 --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Preview migration without making changes
+        sublime migrate feeds --dry-run --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Include system feeds in migration
+        sublime migrate feeds --include-system --source-api-key KEY1 --dest-api-key KEY2
+    """
+    # Create formatter based on output format
+    formatter = create_formatter(output_format)
+    
+    # If --yes flag is provided, modify the formatter to auto-confirm
+    if yes:
+        original_prompt = formatter.prompt_confirmation
+        formatter.prompt_confirmation = lambda _: True
+    
+    # Execute the implementation function
+    result = migrate_feeds_between_instances(
+        source_api_key, source_region, 
+        dest_api_key, dest_region,
+        include_ids, exclude_ids, 
+        include_system,
+        dry_run, formatter
+    )
+    
+    # Reset the formatter if it was modified
+    if yes and hasattr(formatter, 'original_prompt'):
+        formatter.prompt_confirmation = original_prompt
+    
+    # Output the result
+    formatter.output_result(result)

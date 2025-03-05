@@ -18,6 +18,25 @@ class FeedSummary:
     up_to_date: int
     yara_sigs: int
 
+    def to_dict(self) -> Dict:
+        """Convert the feed summary to a dictionary.
+        
+        Returns:
+            Dict: Dictionary representation of the feed summary
+        """
+        return {
+            "active": self.active,
+            "available_changes": self.available_changes,
+            "deletions": self.deletions,
+            "invalid": self.invalid,
+            "installed": self.installed,
+            "new": self.new,
+            "out_of_date": self.out_of_date,
+            "total": self.total,
+            "up_to_date": self.up_to_date,
+            "yara_sigs": self.yara_sigs,
+        }
+
 
 @dataclass
 class Feed:
@@ -67,3 +86,41 @@ class Feed:
             yara_file_filter=data.get("yara_file_filter", ""),
             summary=summary
         )
+    
+    def to_dict(self) -> Dict:
+        """Convert the feed to a dictionary.
+        
+        Returns:
+            Dict: Dictionary representation of the feed
+        """
+        result = {
+            "id": self.id,
+            "name": self.name,
+            "git_url": self.git_url,
+            "git_branch": self.git_branch,
+            "is_system": self.is_system,
+            "checked_at": self.checked_at,
+            "retrieved_at": self.retrieved_at,
+            "auto_update_rules": self.auto_update_rules,
+            "auto_activate_new_rules": self.auto_activate_new_rules,
+            "detection_rule_file_filter": self.detection_rule_file_filter,
+            "triage_rule_file_filter": self.triage_rule_file_filter,
+            "yara_file_filter": self.yara_file_filter,
+        }
+        
+        # Include summary if present
+        if self.summary:
+            result["summary"] = {
+                "active": self.summary.active,
+                "available_changes": self.summary.available_changes,
+                "deletions": self.summary.deletions,
+                "invalid": self.summary.invalid,
+                "installed": self.summary.installed,
+                "new": self.summary.new,
+                "out_of_date": self.summary.out_of_date,
+                "total": self.summary.total,
+                "up_to_date": self.summary.up_to_date,
+                "yara_sigs": self.summary.yara_sigs,
+            }
+        
+        return result

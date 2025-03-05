@@ -54,3 +54,32 @@ class List:
             provider_group_id=data.get("provider_group_id"),
             provider_group_name=data.get("provider_group_name"),
         )
+    
+    def to_dict(self) -> Dict:
+        """Convert the list to a dictionary.
+        
+        Returns:
+            Dict: Dictionary representation of the list
+        """
+        result = {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "entry_type": self.entry_type,
+            "entry_count": self.entry_count,
+            "created_by_user_name": self.created_by_user_name,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+        
+        # Only include non-empty fields
+        if self.entries:
+            result["entries"] = self.entries
+        
+        if self.provider_group_id:
+            result["provider_group_id"] = self.provider_group_id
+            
+        if self.provider_group_name:
+            result["provider_group_name"] = self.provider_group_name
+        
+        return result

@@ -81,3 +81,40 @@ class Exclusion:
             created_by_user_name=data.get("created_by_user_name"),
             originating_rule=originating_rule
         )
+    
+    def to_dict(self) -> Dict:
+        """Convert the exclusion to a dictionary.
+        
+        Returns:
+            Dict: Dictionary representation of the exclusion
+        """
+        result = {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "scope": self.scope,
+            "active": self.active,
+            "source": self.source,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+        
+        # Include optional fields if present
+        if self.created_by_user_name:
+            result["created_by"] = self.created_by_user_name
+        elif self.created_by_org_name:
+            result["created_by"] = self.created_by_org_name
+        
+        if self.tags:
+            result["tags"] = self.tags
+        
+        # Include originating rule if present
+        if self.originating_rule:
+            result["originating_rule"] = {
+                "id": self.originating_rule.id,
+                "name": self.originating_rule.name,
+                "type": self.originating_rule.type,
+                "active": self.originating_rule.active
+            }
+        
+        return result

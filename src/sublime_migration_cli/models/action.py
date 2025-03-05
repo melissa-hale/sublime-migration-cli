@@ -32,3 +32,18 @@ class Action:
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
         )
+    
+    def to_dict(self) -> Dict:
+        """Convert the action to a dictionary.
+        
+        Returns:
+            Dict: Dictionary representation of the action
+        """
+        return {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type,
+            "active": self.active,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at
+        }
