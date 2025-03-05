@@ -1,4 +1,4 @@
-"""Refactored commands for working with Exclusions."""
+"""Refactored commands for working with Exclusions using utility functions."""
 from typing import Optional
 
 import click
@@ -7,6 +7,13 @@ from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.models.exclusion import Exclusion
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import create_boolean_filter
+from sublime_migration_cli.utils.errors import (
+    ApiError, ResourceNotFoundError, handle_api_error, ErrorHandler
+)
 
 
 # Implementation functions
@@ -33,19 +40,22 @@ def fetch_all_exclusions(api_key=None, region=None, scope=None, active=False, fo
         if scope:
             params["scope"] = scope
         
-        # Get exclusions from API
-        with formatter.create_progress("Fetching exclusions...") as (progress, task):
-            response = client.get("/v1/exclusions", params=params)
-            
-            # The API returns a nested object with an "exclusions" key
-            if "exclusions" in response:
-                exclusions_data = response["exclusions"]
-            else:
-                exclusions_data = response  # Fallback if structure changes
+        # Use PaginatedFetcher to get all exclusions
+        fetcher = PaginatedFetcher(client, formatter)
+        exclusions_data = fetcher.fetch_all(
+            "/v1/exclusions",
+            params=params,
+            progress_message="Fetching exclusions...",
+            # Provide custom extractors specifically for exclusions endpoint
+            result_extractor=lambda resp: resp.get("exclusions", []) if isinstance(resp, dict) else resp,
+            total_extractor=lambda resp: len(resp.get("exclusions", [])) if isinstance(resp, dict) else len(resp)
+        )
         
         # Apply active filter if requested (client-side filtering)
         if active:
-            exclusions_data = [ex for ex in exclusions_data if ex.get("active")]
+            # Use our filter utility
+            active_filter = create_boolean_filter("active", True)
+            exclusions_data = active_filter(exclusions_data)
         
         # Convert to Exclusion objects
         exclusions_list = [Exclusion.from_dict(ex) for ex in exclusions_data]
@@ -70,7 +80,10 @@ def fetch_all_exclusions(api_key=None, region=None, scope=None, active=False, fo
         formatter.output_result(result)
         
     except Exception as e:
-        formatter.output_error(f"Failed to get exclusions: {str(e)}")
+        # Use our error handling utilities
+        sublime_error = handle_api_error(e)
+        error_details = ErrorHandler.format_error_for_display(sublime_error)
+        formatter.output_error(f"Failed to get exclusions: {sublime_error.message}", error_details)
 
 
 def get_exclusion_details(exclusion_id, api_key=None, region=None, formatter=None):
@@ -93,6 +106,8 @@ def get_exclusion_details(exclusion_id, api_key=None, region=None, formatter=Non
         # Get exclusion details from API
         with formatter.create_progress(f"Fetching exclusion {exclusion_id}...") as (progress, task):
             response = client.get(f"/v1/exclusions/{exclusion_id}")
+            if progress and task:
+                progress.update(task, advance=1)
         
         # Convert to Exclusion object
         exclusion_obj = Exclusion.from_dict(response)
@@ -106,8 +121,13 @@ def get_exclusion_details(exclusion_id, api_key=None, region=None, formatter=Non
         # Output the result
         formatter.output_result(result)
         
+    except ResourceNotFoundError as e:
+        formatter.output_error(f"Exclusion not found: {e.resource_id}", e.details)
+    except ApiError as e:
+        formatter.output_error(f"Failed to get exclusion details: {e.message}", e.details)
     except Exception as e:
-        formatter.output_error(f"Failed to get exclusion details: {str(e)}")
+        sublime_error = handle_api_error(e)
+        formatter.output_error(f"Error: {sublime_error.message}")
 
 
 # Click command definitions

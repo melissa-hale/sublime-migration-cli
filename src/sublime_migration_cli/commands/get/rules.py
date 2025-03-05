@@ -1,4 +1,4 @@
-"""Refactored commands for working with Rules."""
+"""Refactored commands for working with Rules using utility functions."""
 from typing import Dict, List, Optional, Any
 import click
 
@@ -6,6 +6,13 @@ from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.models.rule import Rule
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import filter_by_ids, create_boolean_filter
+from sublime_migration_cli.utils.errors import (
+    ApiError, ResourceNotFoundError, handle_api_error, ErrorHandler
+)
 
 
 # Implementation functions
@@ -33,9 +40,7 @@ def fetch_all_rules(api_key=None, region=None, rule_type=None, active=False, fee
         client = get_api_client_from_env_or_args(api_key, region)
         
         # Build query parameters for filtering
-        params = {
-            "limit": limit
-        }
+        params = {}
         
         if rule_type:
             params["type"] = rule_type
@@ -45,64 +50,35 @@ def fetch_all_rules(api_key=None, region=None, rule_type=None, active=False, fee
         
         if in_feed is not None:
             params["in_feed"] = "true" if in_feed else "false"
-        
-        # Initialize variables for pagination
-        all_rules = []
-        offset = 0
-        total_rules = None
-        
-        # Fetch rules with pagination
-        with formatter.create_progress("Fetching rules...") as (progress, task):
-            # Continue fetching until we have all rules
-            while True:
-                # Update offset for pagination
-                page_params = params.copy()
-                page_params["offset"] = offset
-                
-                # Fetch a page of rules
-                page = client.get("/v1/rules", params=page_params)
-                
-                # Extract rules from the response
-                if "rules" in page:
-                    page_rules = page.get("rules", [])
-                    count = page.get("count", 0)
-                    total_rules = page.get("total", 0)
-                else:
-                    page_rules = page
-                    count = len(page_rules)
-                    total_rules = count
-                
-                # Add rules to our collection
-                all_rules.extend(page_rules)
-                
-                # Update progress if we know the total
-                if total_rules and task:
-                    progress.update(task, total=total_rules, completed=len(all_rules))
-                
-                # Check if we've fetched all rules
-                if len(all_rules) >= total_rules or len(page_rules) == 0:
-                    break
-                
-                # Update offset for next page
-                offset += limit
+            
+        # Use our PaginatedFetcher to handle pagination
+        fetcher = PaginatedFetcher(client, formatter)
+        rules_data = fetcher.fetch_all(
+            "/v1/rules",
+            params=params,
+            progress_message="Fetching rules...",
+            page_size=limit
+        )
         
         # Apply active filter if requested (client-side filtering)
-        rules_data = all_rules
         if active:
-            rules_data = [rule for rule in rules_data if rule.get("active")]
-        
-        # If showing exclusions, fetch detailed information for each rule
+            # Use our filter utility
+            active_filter = create_boolean_filter("active", True)
+            rules_data = active_filter(rules_data)
+            
+        # If showing exclusions, fetch detailed info for each rule
         if show_exclusions and rules_data:
+            detailed_rules = []
+            
             with formatter.create_progress("Fetching rule details for exclusions...", 
-                                           total=len(rules_data)) as (progress, task):
-                detailed_rules = []
+                                         total=len(rules_data)) as (progress, task):
                 
-                for rule_item in rules_data:
+                for i, rule_item in enumerate(rules_data):
                     try:
                         rule_id = rule_item["id"]
                         details = client.get(f"/v1/rules/{rule_id}")
                         detailed_rules.append(details)
-                    except Exception as e:
+                    except ApiError as e:
                         # If fetching details fails, use original item
                         detailed_rules.append(rule_item)
                         formatter.output_error(
@@ -111,7 +87,8 @@ def fetch_all_rules(api_key=None, region=None, rule_type=None, active=False, fee
                         )
                     
                     # Update progress
-                    progress.update(task, advance=1)
+                    if progress and task:
+                        progress.update(task, completed=i+1)
                 
                 # Replace rules_data with detailed_rules
                 rules_data = detailed_rules
@@ -138,13 +115,6 @@ def fetch_all_rules(api_key=None, region=None, rule_type=None, active=False, fee
         
         if filters:
             result.notes = f"Filtered by {', '.join(filters)}"
-            
-        if total_rules and len(rules_list) < total_rules:
-            additional_note = f"Showing {len(rules_list)} of {total_rules} total rules after filtering"
-            if result.notes:
-                result.notes += f"\n{additional_note}"
-            else:
-                result.notes = additional_note
                 
         if show_exclusions:
             exclusion_note = "Including exclusion information"
@@ -157,7 +127,10 @@ def fetch_all_rules(api_key=None, region=None, rule_type=None, active=False, fee
         formatter.output_result(result)
         
     except Exception as e:
-        formatter.output_error(f"Failed to get rules: {str(e)}")
+        # Use our error handling utilities
+        sublime_error = handle_api_error(e)
+        error_details = ErrorHandler.format_error_for_display(sublime_error)
+        formatter.output_error(f"Failed to get rules: {sublime_error.message}", error_details)
 
 
 def get_rule_details(rule_id, api_key=None, region=None, formatter=None):
@@ -180,6 +153,8 @@ def get_rule_details(rule_id, api_key=None, region=None, formatter=None):
         # Get rule details from API
         with formatter.create_progress(f"Fetching rule {rule_id}...") as (progress, task):
             response = client.get(f"/v1/rules/{rule_id}")
+            if progress and task:
+                progress.update(task, advance=1)
         
         # Convert to Rule object
         rule_obj = Rule.from_dict(response)
@@ -193,8 +168,13 @@ def get_rule_details(rule_id, api_key=None, region=None, formatter=None):
         # Output the result
         formatter.output_result(result)
         
+    except ResourceNotFoundError as e:
+        formatter.output_error(f"Rule not found: {e.resource_id}", e.details)
+    except ApiError as e:
+        formatter.output_error(f"Failed to get rule details: {e.message}", e.details)
     except Exception as e:
-        formatter.output_error(f"Failed to get rule details: {str(e)}")
+        sublime_error = handle_api_error(e)
+        formatter.output_error(f"Error: {sublime_error.message}")
 
 
 # Click command definitions

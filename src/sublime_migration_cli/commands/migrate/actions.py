@@ -1,10 +1,17 @@
-"""Refactored commands for migrating actions between Sublime Security instances."""
+"""Refactored commands for migrating actions using utility functions."""
 from typing import Dict, List, Optional, Set
 import click
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import filter_by_ids, filter_by_types
+from sublime_migration_cli.utils.errors import (
+    ApiError, MigrationError, handle_api_error, ErrorHandler
+)
 
 # Set of action types to exclude from migration
 IGNORE_TYPES = {
@@ -48,21 +55,46 @@ def migrate_actions_between_instances(
             dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
             progress.update(task, advance=1)
         
-        # Fetch actions from source
-        with formatter.create_progress("Fetching actions from source instance...") as (progress, task):
-            source_actions = source_client.get("/v1/actions")
-            progress.update(task, advance=1)
+        # Use PaginatedFetcher to fetch actions from source
+        source_fetcher = PaginatedFetcher(source_client, formatter)
+        source_actions = source_fetcher.fetch_all(
+            "/v1/actions",
+            progress_message="Fetching actions from source instance..."
+        )
         
-        # Apply filters
-        filtered_actions = filter_actions(source_actions, include_ids, exclude_ids, include_types, exclude_types)
+        # Apply filters using our utility functions
+        # First filter by ignored types
+        filtered_actions = filter_by_types(
+            source_actions,
+            ignored_types=IGNORE_TYPES,
+            type_field="type"
+        )
+        
+        # Then apply ID filters
+        filtered_actions = filter_by_ids(
+            filtered_actions, 
+            include_ids, 
+            exclude_ids
+        )
+        
+        # Then apply type filters
+        if include_types or exclude_types:
+            filtered_actions = filter_by_types(
+                filtered_actions,
+                include_types=include_types,
+                exclude_types=exclude_types,
+                type_field="type"
+            )
         
         if not filtered_actions:
             return CommandResult.error("No actions to migrate after applying filters.")
             
-        # Fetch actions from destination for comparison
-        with formatter.create_progress("Fetching actions from destination instance...") as (progress, task):
-            dest_actions = dest_client.get("/v1/actions")
-            progress.update(task, advance=1)
+        # Use PaginatedFetcher to fetch actions from destination
+        dest_fetcher = PaginatedFetcher(dest_client, formatter)
+        dest_actions = dest_fetcher.fetch_all(
+            "/v1/actions",
+            progress_message="Fetching actions from destination instance..."
+        )
         
         # Compare and categorize actions
         new_actions, update_actions = categorize_actions(filtered_actions, dest_actions)
@@ -122,7 +154,7 @@ def migrate_actions_between_instances(
         # Perform the migration
         results = perform_migration(formatter, dest_client, new_actions, update_actions, dest_actions)
         
-        # Combine results with migration_data
+        # Add results to migration data
         migration_data["results"] = results
         
         # Return overall results
@@ -131,47 +163,14 @@ def migrate_actions_between_instances(
             f"{results['skipped']} skipped, {results['failed']} failed",
             migration_data,
             "See details below for operation results."
-)
+        )
         
     except Exception as e:
-        return CommandResult.error(f"Error during migration: {str(e)}")
-
-
-def filter_actions(actions: List[Dict], include_ids: Optional[str], exclude_ids: Optional[str],
-                   include_types: Optional[str], exclude_types: Optional[str]) -> List[Dict]:
-    """Filter actions based on the provided criteria.
-    
-    Args:
-        actions: List of action objects
-        include_ids: Comma-separated list of action IDs to include
-        exclude_ids: Comma-separated list of action IDs to exclude
-        include_types: Comma-separated list of action types to include
-        exclude_types: Comma-separated list of action types to exclude
-        
-    Returns:
-        List[Dict]: Filtered list of actions
-    """
-    filtered = [a for a in actions if a.get("type") not in IGNORE_TYPES]
-    
-    # Filter by IDs
-    if include_ids:
-        ids = [id.strip() for id in include_ids.split(",")]
-        filtered = [a for a in filtered if a.get("id") in ids]
-        
-    if exclude_ids:
-        ids = [id.strip() for id in exclude_ids.split(",")]
-        filtered = [a for a in filtered if a.get("id") not in ids]
-    
-    # Filter by types
-    if include_types:
-        types = [t.strip() for t in include_types.split(",")]
-        filtered = [a for a in filtered if a.get("type") in types]
-        
-    if exclude_types:
-        types = [t.strip() for t in exclude_types.split(",")]
-        filtered = [a for a in filtered if a.get("type") not in types]
-    
-    return filtered
+        sublime_error = handle_api_error(e)
+        if isinstance(sublime_error, ApiError):
+            return CommandResult.error(f"API error during migration: {sublime_error.message}", sublime_error.details)
+        else:
+            return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
 def categorize_actions(source_actions: List[Dict], dest_actions: List[Dict]) -> tuple:
@@ -228,7 +227,7 @@ def perform_migration(formatter, dest_client, new_actions: List[Dict],
     # Process new actions
     if new_actions:
         with formatter.create_progress("Creating new actions...", total=len(new_actions)) as (progress, task):
-            for action in new_actions:
+            for i, action in enumerate(new_actions):
                 try:
                     # Create a clean payload from the source action
                     payload = create_action_payload(action)
@@ -242,6 +241,14 @@ def perform_migration(formatter, dest_client, new_actions: List[Dict],
                         "status": "created"
                     })
                     
+                except ApiError as e:
+                    results["failed"] += 1
+                    results["details"].append({
+                        "name": action.get("name"),
+                        "type": action.get("type"),
+                        "status": "failed",
+                        "reason": e.message
+                    })
                 except Exception as e:
                     results["failed"] += 1
                     results["details"].append({
@@ -251,12 +258,14 @@ def perform_migration(formatter, dest_client, new_actions: List[Dict],
                         "reason": str(e)
                     })
                 
-                progress.update(task, advance=1)
+                # Update progress
+                if progress and task:
+                    progress.update(task, completed=i+1)
     
     # Process updates
     if update_actions:
         with formatter.create_progress("Updating existing actions...", total=len(update_actions)) as (progress, task):
-            for action in update_actions:
+            for i, action in enumerate(update_actions):
                 action_name = action.get("name")
                 existing = existing_map.get(action_name)
                 
@@ -268,7 +277,8 @@ def perform_migration(formatter, dest_client, new_actions: List[Dict],
                         "status": "skipped",
                         "reason": "Action no longer exists in destination"
                     })
-                    progress.update(task, advance=1)
+                    if progress and task:
+                        progress.update(task, completed=i+1)
                     continue
                 
                 try:
@@ -294,6 +304,14 @@ def perform_migration(formatter, dest_client, new_actions: List[Dict],
                             "reason": "No changes needed"
                         })
                         
+                except ApiError as e:
+                    results["failed"] += 1
+                    results["details"].append({
+                        "name": action_name,
+                        "type": action.get("type"),
+                        "status": "failed",
+                        "reason": e.message
+                    })
                 except Exception as e:
                     results["failed"] += 1
                     results["details"].append({
@@ -303,7 +321,9 @@ def perform_migration(formatter, dest_client, new_actions: List[Dict],
                         "reason": str(e)
                     })
                 
-                progress.update(task, advance=1)
+                # Update progress
+                if progress and task:
+                    progress.update(task, completed=i+1)
     
     return results
 
