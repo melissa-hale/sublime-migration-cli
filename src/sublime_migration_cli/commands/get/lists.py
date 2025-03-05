@@ -1,18 +1,31 @@
-"""Refactored commands for working with Lists."""
-from typing import Optional, List as PyList
-from concurrent.futures import ThreadPoolExecutor
+"""Refactored commands for working with Lists using utility functions."""
+from typing import Optional
 
 import click
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.models.list import List
-from sublime_migration_cli.presentation.base import CommandResult, OutputFormatter
+from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.errors import (
+    ApiError, ResourceNotFoundError, handle_api_error, ErrorHandler
+)
 
 
 # Implementation functions
 def fetch_all_lists(api_key=None, region=None, list_type=None, fetch_details=False, formatter=None):
-    """Implementation for fetching all lists."""
+    """Implementation for fetching all lists.
+    
+    Args:
+        api_key: Optional API key
+        region: Optional region code
+        list_type: Filter by list type (string or user_group)
+        fetch_details: Fetch full details for accurate entry counts
+        formatter: Output formatter to use
+    """
     # Default to table formatter if none provided
     if formatter is None:
         formatter = create_formatter("table")
@@ -32,15 +45,30 @@ def fetch_all_lists(api_key=None, region=None, list_type=None, fetch_details=Fal
             # Default: get both types
             list_types = ["string", "user_group"]
         
-        # Get lists for each type
+        # Use PaginatedFetcher for each list type
+        fetcher = PaginatedFetcher(client, formatter)
+        
         with formatter.create_progress("Fetching lists...") as (progress, task):
-            for lt in list_types:
+            progress_total = len(list_types)
+            if progress and task:
+                progress.update(task, total=progress_total)
+                
+            for i, lt in enumerate(list_types):
                 try:
-                    response = client.get("/v1/lists", params={"list_types": lt})
-                    all_lists.extend(response)
-                    progress.update(task, advance=1)  # Update progress
-                except Exception as e:
+                    params = {"list_types": lt}
+                    type_lists = fetcher.fetch_all(
+                        "/v1/lists", 
+                        params=params,
+                        progress_message=None  # Don't show nested progress
+                    )
+                    all_lists.extend(type_lists)
+                    
+                except ApiError as e:
                     formatter.output_error(f"Warning: Failed to get lists of type '{lt}'", str(e))
+                
+                # Update progress
+                if progress and task:
+                    progress.update(task, completed=i+1)
         
         # If requested, fetch full details for each list to get accurate entry counts
         if fetch_details and all_lists:
@@ -48,7 +76,7 @@ def fetch_all_lists(api_key=None, region=None, list_type=None, fetch_details=Fal
             detailed_lists = []
             
             with formatter.create_progress("Fetching list details...", total=len(all_lists)) as (progress, task):
-                for list_item in all_lists:
+                for i, list_item in enumerate(all_lists):
                     try:
                         list_id = list_item["id"]
                         # Fetch detailed info
@@ -61,7 +89,8 @@ def fetch_all_lists(api_key=None, region=None, list_type=None, fetch_details=Fal
                         formatter.output_error(f"Warning: Failed to fetch details for list '{list_item.get('name')}'", str(e))
                     
                     # Update progress
-                    progress.update(task, advance=1)
+                    if progress and task:
+                        progress.update(task, completed=i+1)
                 
                 # Replace all_lists with detailed_lists
                 all_lists = detailed_lists
@@ -85,7 +114,9 @@ def fetch_all_lists(api_key=None, region=None, list_type=None, fetch_details=Fal
         formatter.output_result(result)
         
     except Exception as e:
-        formatter.output_error(f"Failed to get lists: {str(e)}")
+        sublime_error = handle_api_error(e)
+        error_details = ErrorHandler.format_error_for_display(sublime_error)
+        formatter.output_error(f"Failed to get lists: {sublime_error.message}", error_details)
 
 
 def get_list_details(list_id, api_key=None, region=None, formatter=None):
@@ -108,6 +139,8 @@ def get_list_details(list_id, api_key=None, region=None, formatter=None):
         # Get list details from API
         with formatter.create_progress(f"Fetching list {list_id}...") as (progress, task):
             response = client.get(f"/v1/lists/{list_id}")
+            if progress and task:
+                progress.update(task, advance=1)
         
         # Convert to List object
         list_obj = List.from_dict(response)
@@ -121,8 +154,13 @@ def get_list_details(list_id, api_key=None, region=None, formatter=None):
         # Output the result
         formatter.output_result(result)
         
+    except ResourceNotFoundError as e:
+        formatter.output_error(f"List not found: {e.resource_id}", e.details)
+    except ApiError as e:
+        formatter.output_error(f"Failed to get list details: {e.message}", e.details)
     except Exception as e:
-        formatter.output_error(f"Failed to get list details: {str(e)}")
+        sublime_error = handle_api_error(e)
+        formatter.output_error(f"Error: {sublime_error.message}")
 
 
 # Click command definitions

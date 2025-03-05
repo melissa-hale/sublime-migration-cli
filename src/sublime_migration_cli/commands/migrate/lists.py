@@ -1,10 +1,17 @@
-"""Refactored commands for migrating lists between Sublime Security instances."""
+"""Refactored commands for migrating lists using utility functions."""
 from typing import Dict, List, Optional, Set
 import click
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import filter_by_creator, filter_by_ids
+from sublime_migration_cli.utils.errors import (
+    ApiError, MigrationError, handle_api_error, ErrorHandler
+)
 
 # Authors to exclude from migration (system and built-in lists)
 EXCLUDED_AUTHORS = {"Sublime Security", "System"}
@@ -51,23 +58,38 @@ def migrate_lists_between_instances(
             specified_types = [t.strip() for t in include_types.split(",")]
             list_types = [t for t in list_types if t in specified_types]
         
-        # Fetch all lists from source
+        # Use PaginatedFetcher to fetch all lists from source
+        source_fetcher = PaginatedFetcher(source_client, formatter)
         all_source_lists = []
-        with formatter.create_progress("Fetching lists from source...", total=len(list_types)) as (progress, task):
-            for list_type in list_types:
-                try:
-                    response = source_client.get("/v1/lists", params={"list_types": list_type})
-                    all_source_lists.extend(response)
-                    progress.update(task, advance=1)
-                except Exception as e:
-                    formatter.output_error(f"Warning: Failed to fetch {list_type} lists: {str(e)}")
         
-        # Apply filters
-        filtered_lists = filter_lists(
+        with formatter.create_progress("Fetching lists from source...", total=len(list_types)) as (progress, task):
+            for i, list_type in enumerate(list_types):
+                try:
+                    params = {"list_types": list_type}
+                    type_lists = source_fetcher.fetch_all(
+                        "/v1/lists", 
+                        params=params,
+                        progress_message=None  # Don't show nested progress
+                    )
+                    all_source_lists.extend(type_lists)
+                except ApiError as e:
+                    formatter.output_error(f"Warning: Failed to fetch {list_type} lists: {e.message}")
+                
+                # Update progress
+                if progress and task:
+                    progress.update(task, completed=i+1)
+        
+        # Apply filters using our utility functions
+        filtered_lists = filter_by_creator(
             all_source_lists, 
+            include_system_created, 
+            EXCLUDED_AUTHORS
+        )
+        
+        filtered_lists = filter_by_ids(
+            filtered_lists, 
             include_ids, 
-            exclude_ids, 
-            include_system_created
+            exclude_ids
         )
         
         if not filtered_lists:
@@ -77,22 +99,24 @@ def migrate_lists_between_instances(
         source_lists_with_entries = []
         if filtered_lists:
             with formatter.create_progress("Fetching list entries...", total=len(filtered_lists)) as (progress, task):
-                for list_item in filtered_lists:
+                for i, list_item in enumerate(filtered_lists):
                     # Only fetch details for string lists, user_group lists don't need entries
                     if list_item.get("entry_type") == "string":
                         list_id = list_item.get("id")
                         try:
                             detailed_list = source_client.get(f"/v1/lists/{list_id}")
                             source_lists_with_entries.append(detailed_list)
-                        except Exception as e:
-                            formatter.output_error(f"Warning: Failed to fetch entries for list '{list_item.get('name')}': {str(e)}")
+                        except ApiError as e:
+                            formatter.output_error(f"Warning: Failed to fetch entries for list '{list_item.get('name')}': {e.message}")
                             # Still include the list without entries
                             source_lists_with_entries.append(list_item)
                     else:
                         # For user_group lists, use as-is without fetching entries
                         source_lists_with_entries.append(list_item)
                     
-                    progress.update(task, advance=1)
+                    # Update progress
+                    if progress and task:
+                        progress.update(task, completed=i+1)
         
         if not source_lists_with_entries:
             return CommandResult.error("No lists to migrate after fetching details.")
@@ -108,20 +132,31 @@ def migrate_lists_between_instances(
                         group.get("name"): group.get("id") 
                         for group in user_groups_response
                     }
-                    progress.update(task, advance=1)
-                except Exception as e:
-                    formatter.output_error(f"Warning: Failed to fetch user groups from destination: {str(e)}")
+                    if progress and task:
+                        progress.update(task, advance=1)
+                except ApiError as e:
+                    formatter.output_error(f"Warning: Failed to fetch user groups from destination: {e.message}")
         
-        # Fetch lists from destination for comparison
+        # Use PaginatedFetcher to fetch all lists from destination
+        dest_fetcher = PaginatedFetcher(dest_client, formatter)
         dest_lists = []
+        
         with formatter.create_progress("Fetching lists from destination...", total=len(list_types)) as (progress, task):
-            for list_type in list_types:
+            for i, list_type in enumerate(list_types):
                 try:
-                    response = dest_client.get("/v1/lists", params={"list_types": list_type})
-                    dest_lists.extend(response)
-                    progress.update(task, advance=1)
-                except Exception as e:
-                    formatter.output_error(f"Warning: Failed to fetch {list_type} lists from destination: {str(e)}")
+                    params = {"list_types": list_type}
+                    type_lists = dest_fetcher.fetch_all(
+                        "/v1/lists", 
+                        params=params,
+                        progress_message=None  # Don't show nested progress
+                    )
+                    dest_lists.extend(type_lists)
+                except ApiError as e:
+                    formatter.output_error(f"Warning: Failed to fetch {list_type} lists from destination: {e.message}")
+                
+                # Update progress
+                if progress and task:
+                    progress.update(task, completed=i+1)
         
         # Compare and categorize lists
         new_lists, update_lists = categorize_lists(source_lists_with_entries, dest_lists)
@@ -195,38 +230,11 @@ def migrate_lists_between_instances(
         )
         
     except Exception as e:
-        return CommandResult.error(f"Error during migration: {str(e)}")
-
-
-def filter_lists(lists: List[Dict], include_ids: Optional[str], exclude_ids: Optional[str],
-                 include_system_created: bool) -> List[Dict]:
-    """Filter lists based on the provided criteria.
-    
-    Args:
-        lists: List of list objects
-        include_ids: Comma-separated list of list IDs to include
-        exclude_ids: Comma-separated list of list IDs to exclude
-        include_system_created: Include system-created lists (not system)
-        
-    Returns:
-        List[Dict]: Filtered list objects
-    """
-    filtered = lists
-    
-    # Filter by user-created
-    if not include_system_created:
-        filtered = [lst for lst in filtered if lst.get("created_by_user_name") not in EXCLUDED_AUTHORS]
-    
-    # Filter by IDs
-    if include_ids:
-        ids = [id.strip() for id in include_ids.split(",")]
-        filtered = [lst for lst in filtered if lst.get("id") in ids]
-        
-    if exclude_ids:
-        ids = [id.strip() for id in exclude_ids.split(",")]
-        filtered = [lst for lst in filtered if lst.get("id") not in ids]
-    
-    return filtered
+        sublime_error = handle_api_error(e)
+        if isinstance(sublime_error, ApiError):
+            return CommandResult.error(f"API error during migration: {sublime_error.message}", sublime_error.details)
+        else:
+            return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
 def categorize_lists(source_lists: List[Dict], dest_lists: List[Dict]) -> tuple:
@@ -285,16 +293,20 @@ def perform_migration(formatter, dest_client, new_lists: List[Dict],
     # Process new lists
     if new_lists:
         with formatter.create_progress("Creating new lists...", total=len(new_lists)) as (progress, task):
-            for list_item in new_lists:
+            for i, list_item in enumerate(new_lists):
                 process_new_list(list_item, dest_client, dest_user_groups, results)
-                progress.update(task, advance=1)
+                # Update progress
+                if progress and task:
+                    progress.update(task, completed=i+1)
     
     # Process updates
     if update_lists:
         with formatter.create_progress("Updating existing lists...", total=len(update_lists)) as (progress, task):
-            for list_item in update_lists:
+            for i, list_item in enumerate(update_lists):
                 process_update_list(list_item, dest_client, existing_map, dest_user_groups, results, formatter)
-                progress.update(task, advance=1)
+                # Update progress
+                if progress and task:
+                    progress.update(task, completed=i+1)
     
     return results
 
@@ -344,6 +356,14 @@ def process_new_list(list_item: Dict, dest_client, dest_user_groups: Dict[str, s
             "status": "created"
         })
         
+    except ApiError as e:
+        results["failed"] += 1
+        results["details"].append({
+            "name": list_name,
+            "type": list_item.get("entry_type", "unknown"),
+            "status": "failed",
+            "reason": e.message
+        })
     except Exception as e:
         results["failed"] += 1
         results["details"].append({
@@ -443,6 +463,14 @@ def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Di
                     "reason": "No changes needed"
                 })
                 
+    except ApiError as e:
+        results["failed"] += 1
+        results["details"].append({
+            "name": list_name,
+            "type": entry_type,
+            "status": "failed",
+            "reason": e.message
+        })
     except Exception as e:
         results["failed"] += 1
         results["details"].append({

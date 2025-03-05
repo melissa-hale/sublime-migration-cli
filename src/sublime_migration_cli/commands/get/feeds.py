@@ -1,4 +1,4 @@
-"""Refactored commands for working with Feeds."""
+"""Refactored commands for working with Feeds using utility functions."""
 from typing import Optional
 
 import click
@@ -7,6 +7,12 @@ from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.models.feed import Feed
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.errors import (
+    ApiError, ResourceNotFoundError, handle_api_error, ErrorHandler
+)
 
 
 # Implementation functions
@@ -26,15 +32,15 @@ def fetch_all_feeds(api_key=None, region=None, formatter=None):
         # Create client from args or environment variables
         client = get_api_client_from_env_or_args(api_key, region)
         
-        # Get feeds from API
-        with formatter.create_progress("Fetching feeds...") as (progress, task):
-            response = client.get("/v1/feeds")
-            
-            # The API returns a nested object with a "feeds" key
-            if "feeds" in response:
-                feeds_data = response["feeds"]
-            else:
-                feeds_data = response  # Fallback if structure changes
+        # Use PaginatedFetcher to get all feeds
+        fetcher = PaginatedFetcher(client, formatter)
+        feeds_data = fetcher.fetch_all(
+            "/v1/feeds",
+            progress_message="Fetching feeds...",
+            # Provide custom extractors specifically for feeds endpoint
+            result_extractor=lambda resp: resp.get("feeds", []) if isinstance(resp, dict) else resp,
+            total_extractor=lambda resp: len(resp.get("feeds", [])) if isinstance(resp, dict) else len(resp)
+        )
         
         # Convert to Feed objects
         feeds_list = [Feed.from_dict(feed) for feed in feeds_data]
@@ -49,7 +55,10 @@ def fetch_all_feeds(api_key=None, region=None, formatter=None):
         formatter.output_result(result)
         
     except Exception as e:
-        formatter.output_error(f"Failed to get feeds: {str(e)}")
+        # Use our error handling utilities
+        sublime_error = handle_api_error(e)
+        error_details = ErrorHandler.format_error_for_display(sublime_error)
+        formatter.output_error(f"Failed to get feeds: {sublime_error.message}", error_details)
 
 
 def get_feed_details(feed_id, api_key=None, region=None, formatter=None):
@@ -72,6 +81,8 @@ def get_feed_details(feed_id, api_key=None, region=None, formatter=None):
         # Get feed details from API
         with formatter.create_progress(f"Fetching feed {feed_id}...") as (progress, task):
             response = client.get(f"/v1/feeds/{feed_id}")
+            if progress and task:
+                progress.update(task, advance=1)
         
         # Convert to Feed object
         feed_obj = Feed.from_dict(response)
@@ -85,8 +96,13 @@ def get_feed_details(feed_id, api_key=None, region=None, formatter=None):
         # Output the result
         formatter.output_result(result)
         
+    except ResourceNotFoundError as e:
+        formatter.output_error(f"Feed not found: {e.resource_id}", e.details)
+    except ApiError as e:
+        formatter.output_error(f"Failed to get feed details: {e.message}", e.details)
     except Exception as e:
-        formatter.output_error(f"Failed to get feed details: {str(e)}")
+        sublime_error = handle_api_error(e)
+        formatter.output_error(f"Error: {sublime_error.message}")
 
 
 # Click command definitions
