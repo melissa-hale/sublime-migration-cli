@@ -115,7 +115,7 @@ class InteractiveFormatter(OutputFormatter):
             self._output_rules_list(data)
             return
         
-        # Original code for other data types...
+        # Other data types...
         if isinstance(data, list) and data and isinstance(data[0], dict):
             # List of dictionaries - create a table
             self._output_table_from_dict_list(data)
@@ -128,6 +128,13 @@ class InteractiveFormatter(OutputFormatter):
         else:
             # Other data types
             self.console.print(data)
+
+        # Check for migration data (has specific structure)
+        if isinstance(data, dict) and any(key in data for key in [
+                "new_actions", "new_lists", "new_exclusions", "new_feeds", "new_rules", "rules_to_update"
+            ]) and "summary" in data:
+            self._output_migration_preview(data)
+            return
     
     def _output_table(self, table: Table) -> None:
         """Output a Rich table.
@@ -338,3 +345,338 @@ class InteractiveFormatter(OutputFormatter):
         
         # Output the table
         self._output_table(table)
+
+    def _output_migration_preview(self, data: Dict) -> None:
+        """Format and display migration preview data.
+        
+        Args:
+            data: Migration preview data
+        """
+        # Determine migration type and extract items
+        migration_type, new_items, update_items, skipped_items = self._determine_migration_type(data)
+        
+        if not migration_type:
+            # Generic handling for unknown migration types
+            self.console.print(data)
+            return
+        
+        # Display summary
+        summary = data.get("summary", {})
+        self.console.print(f"\n[bold]Migration Summary:[/]")
+        
+        # Different types have different summary fields
+        if "new_count" in summary:
+            self.console.print(f"New items: {summary.get('new_count', 0)}")
+        if "update_count" in summary:
+            self.console.print(f"Updates: {summary.get('update_count', 0)}")
+        if "actions_count" in summary:
+            self.console.print(f"Actions: {summary.get('actions_count', 0)}")
+        if "rules_count" in summary:
+            self.console.print(f"Rules: {summary.get('rules_count', 0)}")
+        if "skipped_count" in summary:
+            self.console.print(f"Skipped: {summary.get('skipped_count', 0)}")
+        if "skipped_rules_count" in summary:
+            self.console.print(f"Skipped rules: {summary.get('skipped_rules_count', 0)}")
+        if "skipped_actions_count" in summary:
+            self.console.print(f"Skipped actions: {summary.get('skipped_actions_count', 0)}")
+        if "total_count" in summary:
+            self.console.print(f"Total: {summary.get('total_count', 0)}")
+        
+        # Display new items if any
+        if new_items:
+            self._display_items_table(migration_type, "New", new_items)
+        
+        # Display update items if any
+        if update_items:
+            # For action-to-rule associations, use a special display format
+            if migration_type == "actions-to-rules":
+                self._display_rule_action_associations(update_items)
+            else:
+                self._display_items_table(migration_type, "Update", update_items)
+        
+        # Display skipped items if any
+        if skipped_items:
+            self._display_skipped_items(migration_type, skipped_items)
+        
+        # Display results if available
+        results = data.get("results")
+        if results:
+            self._display_migration_results(results)
+
+    def _determine_migration_type(self, data: Dict) -> tuple[Optional[str], List, List, List]:
+        """Determine migration type and extract relevant items.
+        
+        Args:
+            data: Migration data
+            
+        Returns:
+            Tuple[str, List, List, List]: Migration type, new items, update items, skipped items
+        """
+        if "new_actions" in data:
+            return "actions", data.get("new_actions", []), data.get("update_actions", []), []
+        elif "new_lists" in data:
+            return "lists", data.get("new_lists", []), data.get("update_lists", []), []
+        elif "new_exclusions" in data:
+            return "exclusions", data.get("new_exclusions", []), data.get("update_exclusions", []), []
+        elif "new_feeds" in data:
+            return "feeds", data.get("new_feeds", []), data.get("update_feeds", []), []
+        elif "new_rules" in data:
+            return "rules", data.get("new_rules", []), data.get("update_rules", []), data.get("skipped_rules", [])
+        elif "rules_to_update" in data and any("actions" in rule for rule in data.get("rules_to_update", [])):
+            return "actions-to-rules", [], data.get("rules_to_update", []), data.get("skipped_rules", []) + data.get("skipped_actions", [])
+        elif "rules_to_update" in data and any("exclusions" in rule for rule in data.get("rules_to_update", [])):
+            return "rule-exclusions", [], data.get("rules_to_update", []), data.get("skipped_rules", []) + data.get("skipped_exclusions", [])
+        
+        return None, [], [], []
+
+    def _display_items_table(self, migration_type: str, action_type: str, items: List):
+        """Display a table of items to migrate.
+        
+        Args:
+            migration_type: Type of migration (actions, lists, etc.)
+            action_type: Type of action (New, Update, etc.)
+            items: List of items to display
+        """
+        if not items:
+            return
+            
+        self.console.print(f"\n[bold]{action_type} {migration_type.title()} to {action_type}:[/]")
+        table = Table()
+        
+        # Common columns for all migration types
+        table.add_column("Name", style="green")
+        table.add_column("Status", style="cyan")
+        
+        # Type-specific columns
+        if migration_type == "actions":
+            table.add_column("Type", style="blue")
+        elif migration_type == "lists":
+            table.add_column("Type", style="blue")
+            table.add_column("Entries", style="magenta", justify="right")
+        elif migration_type == "exclusions":
+            table.add_column("Scope", style="blue")
+            table.add_column("Active", style="magenta", justify="center")
+            table.add_column("Created By", style="yellow")
+        elif migration_type == "feeds":
+            table.add_column("Git URL", style="blue")
+            table.add_column("Branch", style="magenta")
+            table.add_column("System", style="yellow", justify="center")
+        elif migration_type == "rules":
+            table.add_column("Type", style="blue")
+            table.add_column("Severity", style="magenta")
+        
+        # Add rows based on migration type
+        for item in items:
+            row_data = [item.get("name", ""), item.get("status", "")]
+            
+            if migration_type == "actions":
+                row_data.append(item.get("type", ""))
+            elif migration_type == "lists":
+                row_data.append(item.get("type", ""))
+                row_data.append(str(item.get("entries", 0)))
+            elif migration_type == "exclusions":
+                row_data.append(item.get("scope", ""))
+                row_data.append("✓" if item.get("active", False) else "✗")
+                row_data.append(item.get("created_by", ""))
+            elif migration_type == "feeds":
+                row_data.append(item.get("git_url", ""))
+                row_data.append(item.get("git_branch", ""))
+                row_data.append("✓" if item.get("is_system", False) else "✗")
+            elif migration_type == "rules":
+                row_data.append(item.get("type", ""))
+                row_data.append(item.get("severity", ""))
+            
+            table.add_row(*row_data)
+        
+        self.console.print(table)
+
+    def _display_rule_action_associations(self, rules_to_update: List):
+        """Display rule-action associations or rule-exclusions to migrate.
+        
+        Args:
+            rules_to_update: List of rules to update with action associations or exclusions
+        """
+        if not rules_to_update:
+            return
+        
+        # Determine if these are action associations or exclusions based on the first item
+        is_actions = "actions" in rules_to_update[0] if rules_to_update else False
+        is_exclusions = "exclusions" in rules_to_update[0] if rules_to_update else False
+        
+        if is_actions:
+            title = "Rule-Action Associations"
+            col2_title = "Actions"
+        elif is_exclusions:
+            title = "Rule Exclusions"
+            col2_title = "Exclusions"
+        else:
+            title = "Rule Updates"
+            col2_title = "Details"
+            
+        self.console.print(f"\n[bold]{title} to Update:[/]")
+        table = Table()
+        
+        table.add_column("Rule Name", style="green")
+        table.add_column(col2_title, style="blue")
+        table.add_column("Status", style="cyan")
+        
+        for rule in rules_to_update:
+            details = ""
+            if is_actions:
+                details = ", ".join(rule.get("actions", []))
+            elif is_exclusions:
+                details = "\n".join(rule.get("exclusions", []))
+            
+            table.add_row(
+                rule.get("rule_name", ""),
+                details,
+                rule.get("status", "")
+            )
+        
+        self.console.print(table)
+
+    def _display_skipped_items(self, migration_type: str, skipped_items: List):
+        """Display skipped items.
+        
+        Args:
+            migration_type: Type of migration
+            skipped_items: List of skipped items
+        """
+        if not skipped_items:
+            return
+            
+        self.console.print(f"\n[bold]Skipped {migration_type.title()}:[/]")
+        table = Table()
+        
+        if migration_type in ["actions-to-rules", "rule-exclusions"]:
+            # Special handling for action-to-rule associations and rule exclusions
+            is_exclusions = migration_type == "rule-exclusions"
+            
+            table.add_column("Rule Name", style="yellow")
+            table.add_column("Exclusion" if is_exclusions else "Action Name", style="blue")
+            table.add_column("Reason", style="red")
+            
+            for item in skipped_items:
+                # Check if this is a skipped action/exclusion or a skipped rule
+                col2_key = "exclusion" if is_exclusions else "action_name"
+                
+                if col2_key in item:
+                    table.add_row(
+                        item.get("rule_name", ""),
+                        item.get(col2_key, ""),
+                        item.get("reason", "")
+                    )
+                else:
+                    table.add_row(
+                        item.get("rule_name", ""),
+                        "",
+                        item.get("reason", "")
+                    )
+        else:
+            # General handling for other types
+            table.add_column("Name", style="yellow")
+            table.add_column("Type", style="dim")
+            table.add_column("Reason", style="red")
+            
+            for item in skipped_items:
+                table.add_row(
+                    item.get("name", ""),
+                    item.get("type", ""),
+                    item.get("reason", "")
+                )
+        
+        self.console.print(table)
+
+    def _display_migration_results(self, results: Dict):
+        """Display migration results.
+        
+        Args:
+            results: Migration results
+        """
+        self.console.print("\n[bold]Migration Results:[/]")
+        
+        # Display summary counts
+        if "created" in results:
+            self.console.print(f"Created: {results.get('created', 0)}")
+        if "updated" in results:
+            self.console.print(f"Updated: {results.get('updated', 0)}")
+        if "skipped" in results:
+            self.console.print(f"Skipped: {results.get('skipped', 0)}")
+        if "failed" in results:
+            self.console.print(f"Failed: {results.get('failed', 0)}")
+        
+        # Display details if available
+        details = results.get("details", [])
+        if details:
+            self.console.print("\n[bold]Operation Details:[/]")
+            details_table = Table()
+            details_table.add_column("Name", style="green")
+            details_table.add_column("Type", style="blue")
+            details_table.add_column("Status", style="cyan")
+            details_table.add_column("Details", style="yellow")
+            
+            for detail in details:
+                # Get reason or actions count for details column
+                detail_info = detail.get("reason", "")
+                if not detail_info and "actions_count" in detail:
+                    detail_info = f"{detail['actions_count']} actions"
+                
+                details_table.add_row(
+                    detail.get("name", ""),
+                    detail.get("type", ""),
+                    detail.get("status", ""),
+                    detail_info
+                )
+            
+            self.console.print(details_table)
+
+    def _output_migration_plan(self, data: Dict) -> None:
+        """Format and display migration plan data.
+        
+        Args:
+            data: Migration plan data
+        """
+        # Display connection info
+        if "connection_info" in data:
+            conn_info = data["connection_info"]
+            self.console.print("\n[bold]Connection Information:[/]")
+            self.console.print(f"Source: [green]{conn_info['source']['org_name']}[/] ({conn_info['source']['email']})")
+            self.console.print(f"Destination: [green]{conn_info['destination']['org_name']}[/] ({conn_info['destination']['email']})")
+        
+        # Display migration plan
+        if "migration_plan" in data:
+            self.console.print("\n[bold]Migration Plan:[/]")
+            plan_table = Table()
+            plan_table.add_column("#", style="dim")
+            plan_table.add_column("Component", style="green")
+            plan_table.add_column("Status", style="cyan")
+            
+            for step in data["migration_plan"]:
+                status = "[yellow]Will Skip[/]" if step.get("will_skip") else "Will Migrate"
+                plan_table.add_row(str(step.get("step")), step.get("component"), status)
+            
+            self.console.print(plan_table)
+        
+        # Display migration summary if available
+        if "summary" in data:
+            self.console.print("\n[bold]Migration Summary:[/]")
+            summary_table = Table()
+            summary_table.add_column("Component", style="green")
+            summary_table.add_column("Status", style="cyan")
+            
+            for item in data["summary"]:
+                status = item.get("status", "")
+                status_style = ""
+                
+                if status == "success":
+                    status_style = "[green]Success[/]"
+                elif status == "failed":
+                    status_style = "[red]Failed[/]"
+                elif status == "skipped":
+                    status_style = "[yellow]Skipped[/]"
+                else:
+                    status_style = "[gray]Not Run[/]"
+                
+                summary_table.add_row(item.get("component", ""), status_style)
+            
+            self.console.print(summary_table)

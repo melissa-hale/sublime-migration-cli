@@ -1,16 +1,11 @@
-"""Commands for migrating rule exclusions between Sublime Security instances."""
+"""Refactored commands for migrating rule exclusions between Sublime Security instances."""
 from typing import Dict, List, Optional, Set, Tuple
-import json
-import math
 import re
-
 import click
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-from rich.prompt import Confirm
-from rich.table import Table
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
+from sublime_migration_cli.presentation.base import CommandResult
+from sublime_migration_cli.presentation.factory import create_formatter
 
 
 # Regular expression patterns for different types of exclusions
@@ -21,84 +16,68 @@ EXCLUSION_PATTERNS = {
 }
 
 
-@click.command()
-@click.option("--source-api-key", help="API key for the source instance")
-@click.option("--source-region", help="Region of the source instance")
-@click.option("--dest-api-key", help="API key for the destination instance")
-@click.option("--dest-region", help="Region of the destination instance")
-@click.option("--include-rule-ids", help="Comma-separated list of rule IDs to include")
-@click.option("--exclude-rule-ids", help="Comma-separated list of rule IDs to exclude")
-@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
-              help="Output format (table or json)")
-def rule_exclusions(source_api_key, source_region, dest_api_key, dest_region,
-                    include_rule_ids, exclude_rule_ids, dry_run, yes, output_format):
-    """Migrate rule exclusions between Sublime Security instances.
+# Implementation functions
+def migrate_rule_exclusions_between_instances(
+    source_api_key=None, source_region=None, 
+    dest_api_key=None, dest_region=None,
+    include_rule_ids=None, exclude_rule_ids=None,
+    dry_run=False, formatter=None
+):
+    """Implementation for migrating rule exclusions between instances.
     
-    This command copies rule-specific exclusions from the source instance to matching rules
-    in the destination instance.
-    
-    Rules are matched by name and source_md5 hash. Exclusions are added to matching rules
-    in the destination instance.
-    
-    Examples:
-        # Migrate all rule exclusions
-        sublime migrate rule-exclusions --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Migrate exclusions for specific rules
-        sublime migrate rule-exclusions --include-rule-ids id1,id2 --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Preview migration without making changes
-        sublime migrate rule-exclusions --dry-run --source-api-key KEY1 --dest-api-key KEY2
+    Args:
+        source_api_key: API key for source instance
+        source_region: Region for source instance
+        dest_api_key: API key for destination instance
+        dest_region: Region for destination instance
+        include_rule_ids: Comma-separated list of rule IDs to include
+        exclude_rule_ids: Comma-separated list of rule IDs to exclude
+        dry_run: If True, preview changes without applying them
+        formatter: Output formatter
     """
-    console = Console()
-    results = {"status": "started", "message": "Migration of Rule Exclusions"}
-    
-    if output_format == "table":
-        console.print("[bold]Migration of Rule Exclusions[/]")
-    
+    # Default to table formatter if none provided
+    if formatter is None:
+        formatter = create_formatter("table")
+        
     try:
         # Create API clients for source and destination
-        source_client = get_api_client_from_env_or_args(source_api_key, source_region)
-        dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
-        
+        with formatter.create_progress("Connecting to source and destination instances...") as (progress, task):
+            source_client = get_api_client_from_env_or_args(source_api_key, source_region)
+            dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
+            progress.update(task, advance=1)
+            
         # Fetch all rules from source with pagination
-        source_rules = fetch_all_rules(source_client, console, output_format, "source")
+        source_rules = fetch_all_rules(source_client, formatter, "source")
         
         # Apply rule ID filters
         filtered_rules = filter_rules_by_id(source_rules, include_rule_ids, exclude_rule_ids)
         
         # Fetch detailed rule information including exclusions
-        rules_with_details = fetch_rule_details(
-            source_client, filtered_rules, console, output_format
-        )
+        with formatter.create_progress("Fetching rule details for exclusions...", total=len(filtered_rules)) as (progress, task):
+            detailed_rules = []
+            
+            for rule in filtered_rules:
+                try:
+                    rule_id = rule.get("id")
+                    # Fetch detailed info
+                    details = source_client.get(f"/v1/rules/{rule_id}")
+                    detailed_rules.append(details)
+                except Exception as e:
+                    formatter.output_error(f"Warning: Failed to fetch details for rule '{rule.get('name')}': {str(e)}")
+                
+                progress.update(task, advance=1)
         
         # Filter to only rules with exclusions
         rules_with_exclusions = [
-            rule for rule in rules_with_details 
+            rule for rule in detailed_rules 
             if rule.get("exclusions") and len(rule.get("exclusions")) > 0
         ]
         
         if not rules_with_exclusions:
-            message = "No rules with exclusions found after applying filters."
-            if output_format == "table":
-                console.print(f"[yellow]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.error("No rules with exclusions found after applying filters.")
             
-        rules_count_message = f"Found {len(rules_with_exclusions)} rules with exclusions to process."
-        if output_format == "table":
-            console.print(f"[bold]{rules_count_message}[/]")
-        else:
-            results["count"] = len(rules_with_exclusions)
-            results["message"] = rules_count_message
-        
         # Fetch all rules from destination with pagination
-        dest_rules = fetch_all_rules(dest_client, console, output_format, "destination")
+        dest_rules = fetch_all_rules(dest_client, formatter, "destination")
         
         # Create mapping of rules by name and md5 in destination
         dest_rules_map = {
@@ -115,172 +94,103 @@ def rule_exclusions(source_api_key, source_region, dest_api_key, dest_region,
         skipped_rules = matching_results["skipped_rules"]
         skipped_exclusions = matching_results["skipped_exclusions"]
         
-        # Preview changes
+        # If no rules to update, return early
         if not rules_to_update:
-            message = "No rule exclusions can be migrated (all were skipped)."
-            if output_format == "table":
-                console.print(f"[yellow]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                results["skipped_rules"] = len(skipped_rules)
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.error(
+                "No rule exclusions can be migrated (all were skipped).",
+                {
+                    "skipped_rules": len(skipped_rules),
+                    "skipped_exclusions": len(skipped_exclusions)
+                }
+            )
             
-        # Prepare preview message
+        # Prepare response data
         total_exclusions = sum(len(rule["parsed_exclusions"]) for rule in rules_to_update)
-        preview_message = (
-            f"\nPreparing to update {len(rules_to_update)} rules with {total_exclusions} exclusions."
-        )
         
-        if skipped_rules or skipped_exclusions:
-            preview_message += f" {len(skipped_rules)} rules and {len(skipped_exclusions)} exclusions will be skipped."
-            
-        if output_format == "table":
-            console.print(f"[bold]{preview_message}[/]")
-        
-            # Display preview table for rules to update
-            rules_table = Table(title="Rules and Exclusions to Update")
-            rules_table.add_column("Rule Name", style="green")
-            rules_table.add_column("Rule ID in Destination", style="dim")
-            rules_table.add_column("Exclusions", style="blue")
-            
-            for rule in rules_to_update:
-                exclusion_strs = []
-                for exc in rule["parsed_exclusions"]:
-                    exc_type = list(exc.keys())[0]
-                    exc_value = list(exc.values())[0]
-                    exclusion_strs.append(f"{exc_type}: {exc_value}")
-                    
-                exclusions_text = "\n".join(exclusion_strs)
-                rules_table.add_row(
-                    rule["source_rule"].get("name", ""),
-                    rule["dest_rule"].get("id", ""),
-                    exclusions_text
-                )
-            
-            console.print(rules_table)
-            
-            # Display skipped items if any
-            if skipped_rules:
-                skipped_table = Table(title="Skipped Rules")
-                skipped_table.add_column("Rule Name", style="yellow")
-                skipped_table.add_column("Reason", style="red")
-                
-                for item in skipped_rules:
-                    skipped_table.add_row(
-                        item["rule"].get("name", ""),
-                        item["reason"]
-                    )
-                
-                console.print(skipped_table)
-            
-            if skipped_exclusions:
-                skipped_exc_table = Table(title="Skipped Exclusions")
-                skipped_exc_table.add_column("Rule Name", style="yellow")
-                skipped_exc_table.add_column("Exclusion", style="yellow")
-                skipped_exc_table.add_column("Reason", style="red")
-                
-                for item in skipped_exclusions:
-                    skipped_exc_table.add_row(
-                        item["rule"].get("name", ""),
-                        item["exclusion"],
-                        item["reason"]
-                    )
-                
-                console.print(skipped_exc_table)
-        else:
-            # JSON output
-            results["rules_to_update"] = len(rules_to_update)
-            results["total_exclusions"] = total_exclusions
-            results["skipped_rules"] = len(skipped_rules)
-            results["skipped_exclusions"] = len(skipped_exclusions)
-            
-            results["rules_details"] = [
+        migration_data = {
+            "rules_to_update": [
                 {
                     "rule_name": rule["source_rule"].get("name", ""),
-                    "dest_rule_id": rule["dest_rule"].get("id", ""),
+                    "rule_id": rule["dest_rule"].get("id", ""),
                     "exclusions": [
-                        {k: v for k, v in exclusion.items()}
-                        for exclusion in rule["parsed_exclusions"]
-                    ]
+                        f"{next(iter(exc.keys()))}: {next(iter(exc.values()))}"
+                        for exc in rule["parsed_exclusions"]
+                    ],
+                    "status": "Update"
                 }
                 for rule in rules_to_update
+            ],
+            "skipped_rules": [
+                {
+                    "rule_name": item["rule"].get("name", ""),
+                    "reason": item["reason"]
+                }
+                for item in skipped_rules
+            ],
+            "skipped_exclusions": [
+                {
+                    "rule_name": item["rule"].get("name", ""),
+                    "exclusion": item["exclusion"],
+                    "reason": item["reason"]
+                }
+                for item in skipped_exclusions
             ]
-            
-            if skipped_rules:
-                results["skipped_rules_details"] = [
-                    {
-                        "rule_name": item["rule"].get("name", ""),
-                        "reason": item["reason"]
-                    }
-                    for item in skipped_rules
-                ]
-            
-            if skipped_exclusions:
-                results["skipped_exclusions_details"] = [
-                    {
-                        "rule_name": item["rule"].get("name", ""),
-                        "exclusion": item["exclusion"],
-                        "reason": item["reason"]
-                    }
-                    for item in skipped_exclusions
-                ]
+        }
         
-        # If dry run, stop here
+        # Add summary stats
+        migration_data["summary"] = {
+            "rules_count": len(rules_to_update),
+            "exclusions_count": total_exclusions,
+            "skipped_rules_count": len(skipped_rules),
+            "skipped_exclusions_count": len(skipped_exclusions),
+            "total_count": len(rules_to_update) + len(skipped_rules)
+        }
+        
+        # If dry run, return preview data
         if dry_run:
-            dry_run_message = "DRY RUN: No changes were made."
-            if output_format == "table":
-                console.print(f"\n[yellow]{dry_run_message}[/]")
-            else:
-                results["status"] = "dry_run"
-                results["message"] = dry_run_message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.success(
+                "DRY RUN: Preview of rule exclusions to migrate",
+                migration_data,
+                "No changes were made to the destination instance."
+            )
         
-        # Ask for confirmation
-        if not yes and output_format == "table" and not Confirm.ask("\nDo you want to proceed with the migration?"):
-            cancel_message = "Migration canceled by user."
-            console.print(f"[yellow]{cancel_message}[/]")
-            return
+        # Show preview before confirmation in interactive mode
+        formatter.output_result(CommandResult.success(
+            "Rule exclusions that will be migrated:",
+            migration_data,
+            "Please confirm to proceed with migration."
+        ))
+        
+        # Confirm migration if interactive
+        if not formatter.prompt_confirmation("\nDo you want to proceed with the migration?"):
+            return CommandResult.success("Migration canceled by user.")
         
         # Perform the migration
-        migration_results = apply_rule_exclusions(
-            console, dest_client, rules_to_update, output_format
-        )
+        results = apply_rule_exclusions(formatter, dest_client, rules_to_update)
         
-        # Display results
-        results_message = (
-            f"Migration completed: {migration_results['updated']} rules updated with exclusions, "
-            f"{migration_results['skipped']} skipped, {migration_results['failed']} failed"
-        )
+        # Add results to migration data
+        migration_data["results"] = results
         
-        if output_format == "table":
-            console.print(f"\n[bold green]{results_message}[/]")
-        else:
-            results["status"] = "completed"
-            results["message"] = results_message
-            results["details"] = migration_results
-            click.echo(json.dumps(results, indent=2))
+        # Return overall results
+        return CommandResult.success(
+            f"Migration completed: {results['updated']} rules updated with exclusions, "
+            f"{results['skipped']} skipped, {results['failed']} failed",
+            migration_data,
+            "See details below for operation results."
+        )
         
     except Exception as e:
-        error_message = f"Error during migration: {str(e)}"
-        if output_format == "table":
-            console.print(f"[bold red]{error_message}[/]")
-        else:
-            results["status"] = "error"
-            results["error"] = error_message
-            click.echo(json.dumps(results, indent=2))
+        return CommandResult.error(f"Error during migration: {str(e)}")
 
 
-def fetch_all_rules(client, console, output_format, instance_name):
+def fetch_all_rules(client, formatter, instance_name, params=None):
     """Fetch all rules from an instance with pagination.
     
     Args:
         client: API client for the instance
-        console: Rich console for output
-        output_format: Output format (table or json)
+        formatter: Output formatter
         instance_name: Name of the instance (for display)
+        params: Optional query parameters
         
     Returns:
         List[Dict]: All rules from the instance
@@ -290,81 +200,38 @@ def fetch_all_rules(client, console, output_format, instance_name):
     limit = 100
     total = None
     
-    if output_format == "table":
-        with Progress(
-            SpinnerColumn(),
-            TextColumn(f"[bold blue]Fetching rules from {instance_name}..."),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("({task.completed}/{task.total})"),
-            console=console,
-            transient=True
-        ) as progress:
-            # Start with indeterminate progress until we know the total
-            task = progress.add_task("Fetching", total=None)
-            
-            while True:
-                # Fetch a page of rules
-                response = client.get("/v1/rules", params={
-                    "limit": limit,
-                    "offset": offset,
-                    "include_deleted": "false"
-                })
-                
-                # Extract rules
-                if "rules" in response:
-                    page_rules = response["rules"]
-                    page_count = response.get("count", len(page_rules))
-                    page_total = response.get("total", page_count)
-                else:
-                    page_rules = response
-                    page_count = len(page_rules)
-                    page_total = page_count
-                
-                # Update total if we don't have it yet
-                if total is None:
-                    total = page_total
-                    progress.update(task, total=total)
-                
-                # Add rules to our collection
-                all_rules.extend(page_rules)
-                progress.update(task, completed=len(all_rules))
-                
-                # Check if we've fetched all rules
-                if len(all_rules) >= total or len(page_rules) == 0:
-                    break
-                
-                # Update offset for next page
-                offset += limit
-    else:
-        # JSON output mode - no progress indicators
+    params = params or {}
+    params["limit"] = limit
+    
+    with formatter.create_progress(f"Fetching rules from {instance_name}...") as (progress, task):
+        # Continue fetching until we have all rules
         while True:
+            # Update offset for pagination
+            page_params = params.copy()
+            page_params["offset"] = offset
+            
             # Fetch a page of rules
-            response = client.get("/v1/rules", params={
-                "limit": limit,
-                "offset": offset,
-                "include_deleted": "false"
-            })
+            page = client.get("/v1/rules", params=page_params)
             
-            # Extract rules
-            if "rules" in response:
-                page_rules = response["rules"]
-                page_count = response.get("count", len(page_rules))
-                page_total = response.get("total", page_count)
+            # Extract rules from the response
+            if "rules" in page:
+                page_rules = page.get("rules", [])
+                count = page.get("count", 0)
+                total_rules = page.get("total", 0)
             else:
-                page_rules = response
-                page_count = len(page_rules)
-                page_total = page_count
-            
-            # Update total if we don't have it yet
-            if total is None:
-                total = page_total
+                page_rules = page
+                count = len(page_rules)
+                total_rules = count
             
             # Add rules to our collection
             all_rules.extend(page_rules)
             
+            # Update progress if we know the total
+            if total_rules and task:
+                progress.update(task, total=total_rules, completed=len(all_rules))
+            
             # Check if we've fetched all rules
-            if len(all_rules) >= total or len(page_rules) == 0:
+            if len(all_rules) >= total_rules or len(page_rules) == 0:
                 break
             
             # Update offset for next page
@@ -396,58 +263,6 @@ def filter_rules_by_id(rules: List[Dict], include_ids: Optional[str], exclude_id
         filtered = [rule for rule in filtered if rule.get("id") not in ids]
     
     return filtered
-
-
-def fetch_rule_details(client, rules: List[Dict], console: Console, output_format: str) -> List[Dict]:
-    """Fetch detailed rule information including exclusions.
-    
-    Args:
-        client: API client for the source instance
-        rules: List of rule objects to fetch details for
-        console: Rich console for output
-        output_format: Output format
-        
-    Returns:
-        List[Dict]: Rules with detailed information including exclusions
-    """
-    detailed_rules = []
-    
-    if output_format == "table":
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]Fetching rule details..."),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            console=console,
-            transient=True
-        ) as progress:
-            task = progress.add_task("Fetching", total=len(rules))
-            
-            for rule in rules:
-                rule_id = rule.get("id")
-                try:
-                    # Fetch detailed rule information
-                    rule_details = client.get(f"/v1/rules/{rule_id}")
-                    detailed_rules.append(rule_details)
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Failed to fetch details for rule '{rule.get('name')}': {str(e)}[/]")
-                    # Still include the rule without details
-                    detailed_rules.append(rule)
-                
-                progress.update(task, advance=1)
-    else:
-        # JSON output mode - no progress indicators
-        for rule in rules:
-            rule_id = rule.get("id")
-            try:
-                # Fetch detailed rule information
-                rule_details = client.get(f"/v1/rules/{rule_id}")
-                detailed_rules.append(rule_details)
-            except Exception as e:
-                # Just skip the rule
-                pass
-    
-    return detailed_rules
 
 
 def match_rules_and_parse_exclusions(source_rules: List[Dict], dest_rules_map: Dict) -> Dict:
@@ -525,15 +340,13 @@ def parse_exclusion_string(exclusion_str: str) -> Optional[Dict]:
     return None
 
 
-def apply_rule_exclusions(console: Console, dest_client, rules_to_update: List[Dict], 
-                        output_format: str) -> Dict:
+def apply_rule_exclusions(formatter, dest_client, rules_to_update: List[Dict]) -> Dict:
     """Apply exclusions to rules in the destination.
     
     Args:
-        console: Rich console for output
+        formatter: Output formatter
         dest_client: API client for the destination
         rules_to_update: List of rules to update with parsed exclusions
-        output_format: Output format
         
     Returns:
         Dict: Migration results
@@ -545,33 +358,21 @@ def apply_rule_exclusions(console: Console, dest_client, rules_to_update: List[D
         "details": []
     }
     
-    if output_format == "table":
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]Updating rule exclusions..."),
-            console=console
-        ) as progress:
-            task = progress.add_task("Updating", total=len(rules_to_update))
-            
-            for rule_update in rules_to_update:
-                process_rule_exclusion_update(rule_update, dest_client, results, console)
-                progress.update(task, advance=1)
-    else:
-        # JSON output mode - no progress indicators
+    with formatter.create_progress("Updating rule exclusions...", total=len(rules_to_update)) as (progress, task):
         for rule_update in rules_to_update:
-            process_rule_exclusion_update(rule_update, dest_client, results, console)
+            process_rule_exclusion_update(rule_update, dest_client, results)
+            progress.update(task, advance=1)
     
     return results
 
 
-def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict, console: Console):
+def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict):
     """Process a rule exclusion update.
     
     Args:
         rule_update: Rule update information with parsed exclusions
         dest_client: API client for the destination
         results: Results dictionary to update
-        console: Rich console for output
     """
     rule_name = rule_update["source_rule"].get("name", "")
     dest_rule_id = rule_update["dest_rule"].get("id", "")
@@ -586,20 +387,27 @@ def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict,
                 dest_client.post(f"/v1/rules/{dest_rule_id}/add-exclusion", exclusion)
                 succeeded += 1
             except Exception as e:
-                console.print(f"[yellow]Warning: Failed to add exclusion {exclusion} to rule '{rule_name}': {str(e)}[/]")
+                # Record failure but continue with others
+                results["details"].append({
+                    "name": rule_name,
+                    "type": "exclusion",
+                    "status": "failed",
+                    "reason": f"Failed to add exclusion {exclusion}: {str(e)}"
+                })
         
         if succeeded > 0:
             results["updated"] += 1
             results["details"].append({
                 "name": rule_name,
+                "type": "rule",
                 "status": "updated",
-                "exclusions_added": succeeded,
-                "exclusions_failed": len(exclusions) - succeeded
+                "exclusions_count": succeeded
             })
         else:
             results["failed"] += 1
             results["details"].append({
                 "name": rule_name,
+                "type": "rule",
                 "status": "failed",
                 "reason": "All exclusions failed to apply"
             })
@@ -608,7 +416,63 @@ def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict,
         results["failed"] += 1
         results["details"].append({
             "name": rule_name,
+            "type": "rule",
             "status": "failed",
             "reason": str(e)
         })
-        console.print(f"[red]Failed to update rule '{rule_name}' with exclusions: {str(e)}[/]")
+
+
+# Click command definition
+@click.command()
+@click.option("--source-api-key", help="API key for the source instance")
+@click.option("--source-region", help="Region of the source instance")
+@click.option("--dest-api-key", help="API key for the destination instance")
+@click.option("--dest-region", help="Region of the destination instance")
+@click.option("--include-rule-ids", help="Comma-separated list of rule IDs to include")
+@click.option("--exclude-rule-ids", help="Comma-separated list of rule IDs to exclude")
+@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
+              help="Output format (table or json)")
+def rule_exclusions(source_api_key, source_region, dest_api_key, dest_region,
+                    include_rule_ids, exclude_rule_ids, dry_run, yes, output_format):
+    """Migrate rule exclusions between Sublime Security instances.
+    
+    This command copies rule-specific exclusions from the source instance to matching rules
+    in the destination instance.
+    
+    Rules are matched by name and source_md5 hash. Exclusions are added to matching rules
+    in the destination instance.
+    
+    Examples:
+        # Migrate all rule exclusions
+        sublime migrate rule-exclusions --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Migrate exclusions for specific rules
+        sublime migrate rule-exclusions --include-rule-ids id1,id2 --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Preview migration without making changes
+        sublime migrate rule-exclusions --dry-run --source-api-key KEY1 --dest-api-key KEY2
+    """
+    # Create formatter based on output format
+    formatter = create_formatter(output_format)
+    
+    # If --yes flag is provided, modify the formatter to auto-confirm
+    if yes:
+        original_prompt = formatter.prompt_confirmation
+        formatter.prompt_confirmation = lambda _: True
+    
+    # Execute the implementation function
+    result = migrate_rule_exclusions_between_instances(
+        source_api_key, source_region, 
+        dest_api_key, dest_region,
+        include_rule_ids, exclude_rule_ids,
+        dry_run, formatter
+    )
+    
+    # Reset the formatter if it was modified
+    if yes and hasattr(formatter, 'original_prompt'):
+        formatter.prompt_confirmation = original_prompt
+    
+    # Output the result
+    formatter.output_result(result)

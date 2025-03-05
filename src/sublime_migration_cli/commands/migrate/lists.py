@@ -1,65 +1,47 @@
-"""Commands for migrating lists between Sublime Security instances."""
+"""Refactored commands for migrating lists between Sublime Security instances."""
 from typing import Dict, List, Optional, Set
-import json
-
 import click
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm
-from rich.table import Table
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
-
+from sublime_migration_cli.presentation.base import CommandResult
+from sublime_migration_cli.presentation.factory import create_formatter
 
 # Authors to exclude from migration (system and built-in lists)
 EXCLUDED_AUTHORS = {"Sublime Security", "System"}
 
 
-@click.command()
-@click.option("--source-api-key", help="API key for the source instance")
-@click.option("--source-region", help="Region of the source instance")
-@click.option("--dest-api-key", help="API key for the destination instance")
-@click.option("--dest-region", help="Region of the destination instance")
-@click.option("--include-ids", help="Comma-separated list of list IDs to include")
-@click.option("--exclude-ids", help="Comma-separated list of list IDs to exclude")
-@click.option("--include-types", help="Comma-separated list of list types to include (string, user_group)")
-@click.option("--include-system-created", is_flag=True, 
-              help="Include system-created lists (by default, only user-created lists are migrated)")
-@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
-              help="Output format (table or json)")
-def lists(source_api_key, source_region, dest_api_key, dest_region,
-          include_ids, exclude_ids, include_types, include_system_created,
-          dry_run, yes, output_format):
-    """Migrate lists between Sublime Security instances.
+# Implementation functions
+def migrate_lists_between_instances(
+    source_api_key=None, source_region=None, 
+    dest_api_key=None, dest_region=None,
+    include_ids=None, exclude_ids=None, 
+    include_types=None, include_system_created=False,
+    dry_run=False, formatter=None
+):
+    """Implementation for migrating lists between instances.
     
-    This command copies lists from the source instance to the destination instance.
-    It can selectively migrate specific lists by ID or type.
-    
-    By default, only user-created lists are migrated (not those created by "Sublime Security" or "System").
-    Use --include-system-created to include system-created lists in the migration.
-    
-    Examples:
-        # Migrate all user-created lists
-        sublime migrate lists --include-user-created --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Migrate only string lists
-        sublime migrate lists --include-types string --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Preview migration without making changes
-        sublime migrate lists --dry-run --source-api-key KEY1 --dest-api-key KEY2
+    Args:
+        source_api_key: API key for source instance
+        source_region: Region for source instance
+        dest_api_key: API key for destination instance
+        dest_region: Region for destination instance
+        include_ids: Comma-separated list of list IDs to include
+        exclude_ids: Comma-separated list of list IDs to exclude
+        include_types: Comma-separated list of list types to include
+        include_system_created: Include system-created lists
+        dry_run: If True, preview changes without applying them
+        formatter: Output formatter
     """
-    console = Console()
-    results = {"status": "started", "message": "Migration of Lists"}
-    
-    if output_format == "table":
-        console.print("[bold]Migration of Lists[/]")
-    
+    # Default to table formatter if none provided
+    if formatter is None:
+        formatter = create_formatter("table")
+        
     try:
         # Create API clients for source and destination
-        source_client = get_api_client_from_env_or_args(source_api_key, source_region)
-        dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
+        with formatter.create_progress("Connecting to source and destination instances...") as (progress, task):
+            source_client = get_api_client_from_env_or_args(source_api_key, source_region)
+            dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
+            progress.update(task, advance=1)
         
         # Get all list types
         list_types = ["string", "user_group"]
@@ -71,30 +53,14 @@ def lists(source_api_key, source_region, dest_api_key, dest_region,
         
         # Fetch all lists from source
         all_source_lists = []
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Fetching lists from source..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Fetching", total=len(list_types))
-                
-                for list_type in list_types:
-                    try:
-                        response = source_client.get("/v1/lists", params={"list_types": list_type})
-                        all_source_lists.extend(response)
-                    except Exception as e:
-                        console.print(f"[yellow]Warning: Failed to fetch {list_type} lists: {str(e)}[/]")
-                    
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode - no progress indicators
+        with formatter.create_progress("Fetching lists from source...", total=len(list_types)) as (progress, task):
             for list_type in list_types:
                 try:
                     response = source_client.get("/v1/lists", params={"list_types": list_type})
                     all_source_lists.extend(response)
+                    progress.update(task, advance=1)
                 except Exception as e:
-                    results["warning"] = f"Failed to fetch {list_type} lists: {str(e)}"
+                    formatter.output_error(f"Warning: Failed to fetch {list_type} lists: {str(e)}")
         
         # Apply filters
         filtered_lists = filter_lists(
@@ -105,242 +71,131 @@ def lists(source_api_key, source_region, dest_api_key, dest_region,
         )
         
         if not filtered_lists:
-            message = "No lists to migrate after applying filters."
-            if output_format == "table":
-                console.print(f"[yellow]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                click.echo(json.dumps(results, indent=2))
-            return
-        
+            return CommandResult.error("No lists to migrate after applying filters.")
+            
         # Fetch complete list data with entries for each list
         source_lists_with_entries = []
         if filtered_lists:
-            if output_format == "table":
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[bold blue]Fetching list entries..."),
-                    console=console
-                ) as progress:
-                    task = progress.add_task("Fetching", total=len(filtered_lists))
-                    
-                    for list_item in filtered_lists:
-                        # Only fetch details for string lists, user_group lists don't need entries
-                        if list_item.get("entry_type") == "string":
-                            list_id = list_item.get("id")
-                            try:
-                                detailed_list = source_client.get(f"/v1/lists/{list_id}")
-                                source_lists_with_entries.append(detailed_list)
-                            except Exception as e:
-                                console.print(f"[yellow]Warning: Failed to fetch entries for list '{list_item.get('name')}': {str(e)}[/]")
-                                # Still include the list without entries
-                                source_lists_with_entries.append(list_item)
-                        else:
-                            # For user_group lists, use as-is without fetching entries
-                            source_lists_with_entries.append(list_item)
-                        
-                        progress.update(task, advance=1)
-            else:
-                # JSON output mode
+            with formatter.create_progress("Fetching list entries...", total=len(filtered_lists)) as (progress, task):
                 for list_item in filtered_lists:
+                    # Only fetch details for string lists, user_group lists don't need entries
                     if list_item.get("entry_type") == "string":
                         list_id = list_item.get("id")
                         try:
                             detailed_list = source_client.get(f"/v1/lists/{list_id}")
                             source_lists_with_entries.append(detailed_list)
                         except Exception as e:
-                            # Add a warning to results
-                            results.setdefault("warnings", []).append(
-                            f"Failed to fetch entries for list '{list_item.get('name')}': {str(e)}"
-                        )
+                            formatter.output_error(f"Warning: Failed to fetch entries for list '{list_item.get('name')}': {str(e)}")
                             # Still include the list without entries
                             source_lists_with_entries.append(list_item)
                     else:
+                        # For user_group lists, use as-is without fetching entries
                         source_lists_with_entries.append(list_item)
+                    
+                    progress.update(task, advance=1)
         
-        # # Apply filters
-        # filtered_lists = filter_lists(
-        #     source_lists_with_entries, 
-        #     include_ids, 
-        #     exclude_ids, 
-        #     include_system_created
-        # )
-        
-        # if not filtered_lists:
-        #     message = "No lists to migrate after applying filters."
-        #     if output_format == "table":
-        #         console.print(f"[yellow]{message}[/]")
-        #     else:
-        #         results["status"] = "completed"
-        #         results["message"] = message
-        #         click.echo(json.dumps(results, indent=2))
-        #     return
+        if not source_lists_with_entries:
+            return CommandResult.error("No lists to migrate after fetching details.")
             
-        list_count_message = f"Found {len(source_lists_with_entries)} lists to migrate."
-        if output_format == "table":
-            console.print(f"[bold]{list_count_message}[/]")
-        else:
-            results["count"] = len(source_lists_with_entries)
-            results["message"] = list_count_message
-        
         # For user_group lists, we need to fetch user groups from destination
         dest_user_groups = {}
         if any(l.get("entry_type") == "user_group" for l in source_lists_with_entries):
-            try:
-                user_groups_response = dest_client.get("/v1/user-groups")
-                # Create a mapping of user group names to IDs
-                dest_user_groups = {
-                    group.get("name"): group.get("id") 
-                    for group in user_groups_response
-                }
-            except Exception as e:
-                error_msg = f"Failed to fetch user groups from destination: {str(e)}"
-                if output_format == "table":
-                    console.print(f"[yellow]Warning: {error_msg}[/]")
-                else:
-                    results.setdefault("warnings", []).append(error_msg)
+            with formatter.create_progress("Fetching user groups from destination...") as (progress, task):
+                try:
+                    user_groups_response = dest_client.get("/v1/user-groups")
+                    # Create a mapping of user group names to IDs
+                    dest_user_groups = {
+                        group.get("name"): group.get("id") 
+                        for group in user_groups_response
+                    }
+                    progress.update(task, advance=1)
+                except Exception as e:
+                    formatter.output_error(f"Warning: Failed to fetch user groups from destination: {str(e)}")
         
         # Fetch lists from destination for comparison
         dest_lists = []
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Fetching lists from destination..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Fetching", total=len(list_types))
-                
-                for list_type in list_types:
-                    try:
-                        response = dest_client.get("/v1/lists", params={"list_types": list_type})
-                        dest_lists.extend(response)
-                    except Exception as e:
-                        console.print(f"[yellow]Warning: Failed to fetch {list_type} lists from destination: {str(e)}[/]")
-                    
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode
+        with formatter.create_progress("Fetching lists from destination...", total=len(list_types)) as (progress, task):
             for list_type in list_types:
                 try:
                     response = dest_client.get("/v1/lists", params={"list_types": list_type})
                     dest_lists.extend(response)
+                    progress.update(task, advance=1)
                 except Exception as e:
-                    results.setdefault("warnings", []).append(
-                        f"Failed to fetch {list_type} lists from destination: {str(e)}"
-                    )
+                    formatter.output_error(f"Warning: Failed to fetch {list_type} lists from destination: {str(e)}")
         
         # Compare and categorize lists
         new_lists, update_lists = categorize_lists(source_lists_with_entries, dest_lists)
         
-        # Preview changes
+        # If no lists to migrate, return early
         if not new_lists and not update_lists:
-            message = "All selected lists already exist in the destination instance."
-            if output_format == "table":
-                console.print(f"[green]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.success("All selected lists already exist in the destination instance.")
             
-        preview_message = f"\nPreparing to migrate {len(new_lists)} new lists and potentially update {len(update_lists)} existing lists."
-        if output_format == "table":
-            console.print(f"[bold]{preview_message}[/]")
-        
-            # Display preview table
-            preview_table = Table(title="Lists to Migrate")
-            preview_table.add_column("ID", style="dim", no_wrap=True)
-            preview_table.add_column("Name", style="green")
-            preview_table.add_column("Type", style="blue")
-            preview_table.add_column("Entries", style="cyan", justify="right")
-            preview_table.add_column("Status", style="magenta")
-            
-            for list_item in new_lists:
-                preview_table.add_row(
-                    list_item.get("id", ""),
-                    list_item.get("name", ""),
-                    list_item.get("entry_type", ""),
-                    str(list_item.get("entry_count", len(list_item.get("entries", [])) if list_item.get("entries") is not None else 0)),
-                    "New"
-                )
-            
-            for list_item in update_lists:
-                preview_table.add_row(
-                    list_item.get("id", ""),
-                    list_item.get("name", ""),
-                    list_item.get("entry_type", ""),
-                    str(list_item.get("entry_count", len(list_item.get("entries", [])) if list_item.get("entries") is not None else 0)),
-                    "Update (if different)"
-                )
-            
-            console.print(preview_table)
-        else:
-            # JSON output
-            results["new_lists"] = len(new_lists)
-            results["update_lists"] = len(update_lists)
-            results["lists_to_migrate"] = [
+        # Prepare response data
+        migration_data = {
+            "new_lists": [
                 {
-                    "id": item.get("id", ""),
-                    "name": item.get("name", ""),
-                    "type": item.get("entry_type", ""),
-                    "entries": len(item.get("entries", [])),
+                    "id": list_item.get("id", ""),
+                    "name": list_item.get("name", ""),
+                    "type": list_item.get("entry_type", ""),
+                    "entries": len(list_item.get("entries", [])) if list_item.get("entries") is not None else 0,
                     "status": "New"
                 }
-                for item in new_lists
-            ] + [
+                for list_item in new_lists
+            ],
+            "update_lists": [
                 {
-                    "id": item.get("id", ""),
-                    "name": item.get("name", ""),
-                    "type": item.get("entry_type", ""),
-                    "entries": len(item.get("entries", [])),
+                    "id": list_item.get("id", ""),
+                    "name": list_item.get("name", ""),
+                    "type": list_item.get("entry_type", ""),
+                    "entries": len(list_item.get("entries", [])) if list_item.get("entries") is not None else 0,
                     "status": "Update (if different)"
                 }
-                for item in update_lists
+                for list_item in update_lists
             ]
+        }
         
-        # If dry run, stop here
+        # Add summary stats
+        migration_data["summary"] = {
+            "new_count": len(new_lists),
+            "update_count": len(update_lists),
+            "total_count": len(new_lists) + len(update_lists)
+        }
+        
+        # If dry run, return preview data
         if dry_run:
-            dry_run_message = "DRY RUN: No changes were made."
-            if output_format == "table":
-                console.print(f"\n[yellow]{dry_run_message}[/]")
-            else:
-                results["status"] = "dry_run"
-                results["message"] = dry_run_message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.success(
+                "DRY RUN: Preview of lists to migrate",
+                migration_data,
+                "No changes were made to the destination instance."
+            )
         
-        # Ask for confirmation
-        if not yes and output_format == "table" and not Confirm.ask("\nDo you want to proceed with the migration?"):
-            cancel_message = "Migration canceled by user."
-            console.print(f"[yellow]{cancel_message}[/]")
-            return
+        # Show preview before confirmation in interactive mode
+        formatter.output_result(CommandResult.success(
+            "Lists that will be migrated:",
+            migration_data,
+            "Please confirm to proceed with migration."
+        ))
         
-        # Perform actual migration
-        migration_results = migrate_lists(
-            console, dest_client, new_lists, update_lists, dest_lists, 
-            dest_user_groups, output_format
+        # Confirm migration if interactive
+        if not formatter.prompt_confirmation("\nDo you want to proceed with the migration?"):
+            return CommandResult.success("Migration canceled by user.")
+        
+        # Perform the migration
+        results = perform_migration(formatter, dest_client, new_lists, update_lists, dest_lists, dest_user_groups)
+        
+        # Add results to migration data
+        migration_data["results"] = results
+        
+        # Return overall results
+        return CommandResult.success(
+            f"Migration completed: {results['created']} created, {results['updated']} updated, "
+            f"{results['skipped']} skipped, {results['failed']} failed",
+            migration_data,
+            "See details below for operation results."
         )
         
-        # Display results
-        results_message = f"Migration completed: {migration_results['created']} created, {migration_results['updated']} updated, {migration_results['skipped']} skipped, {migration_results['failed']} failed"
-        
-        if output_format == "table":
-            console.print(f"\n[bold green]{results_message}[/]")
-        else:
-            results["status"] = "completed"
-            results["message"] = results_message
-            results["details"] = migration_results
-            click.echo(json.dumps(results, indent=2))
-        
     except Exception as e:
-        error_message = f"Error during migration: {str(e)}"
-        if output_format == "table":
-            console.print(f"[bold red]{error_message}[/]")
-        else:
-            results["status"] = "error"
-            results["error"] = error_message
-            click.echo(json.dumps(results, indent=2))
+        return CommandResult.error(f"Error during migration: {str(e)}")
 
 
 def filter_lists(lists: List[Dict], include_ids: Optional[str], exclude_ids: Optional[str],
@@ -400,22 +255,21 @@ def categorize_lists(source_lists: List[Dict], dest_lists: List[Dict]) -> tuple:
     return new_lists, update_lists
 
 
-def migrate_lists(console: Console, dest_client, new_lists: List[Dict], 
-                  update_lists: List[Dict], existing_lists: List[Dict],
-                  dest_user_groups: Dict[str, str], output_format: str) -> Dict:
-    """Migrate lists to the destination instance.
+def perform_migration(formatter, dest_client, new_lists: List[Dict], 
+                     update_lists: List[Dict], existing_lists: List[Dict],
+                     dest_user_groups: Dict[str, str]) -> Dict:
+    """Perform the actual migration of lists to the destination.
     
     Args:
-        console: Rich console for output
-        dest_client: API client for the destination
+        formatter: Output formatter
+        dest_client: API client for destination
         new_lists: List of new lists to create
-        update_lists: List of lists to potentially update
-        existing_lists: List of existing lists in the destination
+        update_lists: List of lists to update
+        existing_lists: List of existing lists in destination
         dest_user_groups: Mapping of user group names to IDs
-        output_format: Output format ("table" or "json")
         
     Returns:
-        Dict: Migration results summary
+        Dict: Results of the migration
     """
     results = {
         "created": 0,
@@ -430,39 +284,17 @@ def migrate_lists(console: Console, dest_client, new_lists: List[Dict],
     
     # Process new lists
     if new_lists:
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Creating new lists..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Creating", total=len(new_lists))
-                
-                for list_item in new_lists:
-                    process_new_list(list_item, dest_client, dest_user_groups, results)
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode - no progress indicators
+        with formatter.create_progress("Creating new lists...", total=len(new_lists)) as (progress, task):
             for list_item in new_lists:
                 process_new_list(list_item, dest_client, dest_user_groups, results)
+                progress.update(task, advance=1)
     
     # Process updates
     if update_lists:
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Updating existing lists..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Updating", total=len(update_lists))
-                
-                for list_item in update_lists:
-                    process_update_list(list_item, dest_client, existing_map, dest_user_groups, results, console, output_format)
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode - no progress indicators
+        with formatter.create_progress("Updating existing lists...", total=len(update_lists)) as (progress, task):
             for list_item in update_lists:
-                process_update_list(list_item, dest_client, existing_map, dest_user_groups, results, console, output_format)
+                process_update_list(list_item, dest_client, existing_map, dest_user_groups, results, formatter)
+                progress.update(task, advance=1)
     
     return results
 
@@ -483,6 +315,7 @@ def process_new_list(list_item: Dict, dest_client, dest_user_groups: Dict[str, s
                 results["failed"] += 1
                 results["details"].append({
                     "name": list_name,
+                    "type": entry_type,
                     "status": "failed",
                     "reason": f"User group '{provider_group_name}' not found in destination"
                 })
@@ -507,6 +340,7 @@ def process_new_list(list_item: Dict, dest_client, dest_user_groups: Dict[str, s
         results["created"] += 1
         results["details"].append({
             "name": list_name,
+            "type": entry_type,
             "status": "created"
         })
         
@@ -514,22 +348,24 @@ def process_new_list(list_item: Dict, dest_client, dest_user_groups: Dict[str, s
         results["failed"] += 1
         results["details"].append({
             "name": list_name,
+            "type": list_item.get("entry_type", "unknown"),
             "status": "failed",
             "reason": str(e)
         })
 
 
 def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Dict], 
-                        dest_user_groups: Dict[str, str], results: Dict, 
-                        console: Console, output_format: str):
+                       dest_user_groups: Dict[str, str], results: Dict, formatter):
     """Process a list update for migration."""
     list_name = list_item.get("name", "")
+    entry_type = list_item.get("entry_type", "string")
     existing = existing_map.get(list_name)
     
     if not existing:
         results["skipped"] += 1
         results["details"].append({
             "name": list_name,
+            "type": entry_type,
             "status": "skipped",
             "reason": "List not found in destination"
         })
@@ -537,8 +373,6 @@ def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Di
     
     try:
         # Handle different list types
-        entry_type = list_item.get("entry_type", "string")
-        
         if entry_type == "user_group":
             # For user_group lists, we need to check if the provider group has changed
             source_provider_name = list_item.get("provider_group_name")
@@ -548,6 +382,7 @@ def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Di
                 results["failed"] += 1
                 results["details"].append({
                     "name": list_name,
+                    "type": entry_type,
                     "status": "failed",
                     "reason": f"User group '{source_provider_name}' not found in destination"
                 })
@@ -564,6 +399,7 @@ def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Di
                 results["updated"] += 1
                 results["details"].append({
                     "name": list_name,
+                    "type": entry_type,
                     "status": "updated",
                     "reason": "Provider group changed"
                 })
@@ -571,6 +407,7 @@ def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Di
                 results["skipped"] += 1
                 results["details"].append({
                     "name": list_name,
+                    "type": entry_type,
                     "status": "skipped",
                     "reason": "No changes needed"
                 })
@@ -593,6 +430,7 @@ def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Di
                 results["updated"] += 1
                 results["details"].append({
                     "name": list_name,
+                    "type": entry_type,
                     "status": "updated",
                     "reason": "Entries changed"
                 })
@@ -600,18 +438,77 @@ def process_update_list(list_item: Dict, dest_client, existing_map: Dict[str, Di
                 results["skipped"] += 1
                 results["details"].append({
                     "name": list_name,
+                    "type": entry_type,
                     "status": "skipped",
                     "reason": "No changes needed"
                 })
                 
     except Exception as e:
-        error_message = f"Failed to update list '{list_name}': {str(e)}"
         results["failed"] += 1
         results["details"].append({
             "name": list_name,
+            "type": entry_type,
             "status": "failed",
             "reason": str(e)
         })
+
+
+# Click command definition
+@click.command()
+@click.option("--source-api-key", help="API key for the source instance")
+@click.option("--source-region", help="Region of the source instance")
+@click.option("--dest-api-key", help="API key for the destination instance")
+@click.option("--dest-region", help="Region of the destination instance")
+@click.option("--include-ids", help="Comma-separated list of list IDs to include")
+@click.option("--exclude-ids", help="Comma-separated list of list IDs to exclude")
+@click.option("--include-types", help="Comma-separated list of list types to include (string, user_group)")
+@click.option("--include-system-created", is_flag=True, 
+              help="Include system-created lists (by default, only user-created lists are migrated)")
+@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
+              help="Output format (table or json)")
+def lists(source_api_key, source_region, dest_api_key, dest_region,
+          include_ids, exclude_ids, include_types, include_system_created,
+          dry_run, yes, output_format):
+    """Migrate lists between Sublime Security instances.
+    
+    This command copies lists from the source instance to the destination instance.
+    It can selectively migrate specific lists by ID or type.
+    
+    By default, only user-created lists are migrated (not those created by "Sublime Security" or "System").
+    Use --include-system-created to include system-created lists in the migration.
+    
+    Examples:
+        # Migrate all user-created lists
+        sublime migrate lists --source-api-key KEY1 --dest-api-key KEY2
         
-        if output_format == "table":
-            console.print(f"[red]{error_message}[/]")
+        # Migrate only string lists
+        sublime migrate lists --include-types string --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Preview migration without making changes
+        sublime migrate lists --dry-run --source-api-key KEY1 --dest-api-key KEY2
+    """
+    # Create formatter based on output format
+    formatter = create_formatter(output_format)
+    
+    # If --yes flag is provided, modify the formatter to auto-confirm
+    if yes:
+        original_prompt = formatter.prompt_confirmation
+        formatter.prompt_confirmation = lambda _: True
+    
+    # Execute the implementation function
+    result = migrate_lists_between_instances(
+        source_api_key, source_region, 
+        dest_api_key, dest_region,
+        include_ids, exclude_ids, 
+        include_types, include_system_created,
+        dry_run, formatter
+    )
+    
+    # Reset the formatter if it was modified
+    if yes and hasattr(formatter, 'original_prompt'):
+        formatter.prompt_confirmation = original_prompt
+    
+    # Output the result
+    formatter.output_result(result)

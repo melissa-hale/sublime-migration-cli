@@ -1,187 +1,81 @@
-"""Commands for migrating rules between Sublime Security instances."""
-from typing import Dict, List, Optional
-import json
-
+"""Refactored commands for migrating rules between Sublime Security instances."""
+from typing import Dict, List, Optional, Set
 import click
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm
-from rich.table import Table
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
+from sublime_migration_cli.presentation.base import CommandResult
+from sublime_migration_cli.presentation.factory import create_formatter
 
 
-@click.command()
-@click.option("--source-api-key", help="API key for the source instance")
-@click.option("--source-region", help="Region of the source instance")
-@click.option("--dest-api-key", help="API key for the destination instance")
-@click.option("--dest-region", help="Region of the destination instance")
-@click.option("--include-ids", help="Comma-separated list of rule IDs to include")
-@click.option("--exclude-ids", help="Comma-separated list of rule IDs to exclude")
-@click.option("--type", "rule_type", type=click.Choice(["detection", "triage"]), 
-              help="Filter by rule type (detection or triage)")
-@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
-              help="Output format (table or json)")
-def rules(source_api_key, source_region, dest_api_key, dest_region,
-          include_ids, exclude_ids, rule_type, dry_run, yes, output_format):
-    """Migrate rules between Sublime Security instances.
+# Implementation functions
+def migrate_rules_between_instances(
+    source_api_key=None, source_region=None, 
+    dest_api_key=None, dest_region=None,
+    include_rule_ids=None, exclude_rule_ids=None, 
+    rule_type=None,
+    dry_run=False, formatter=None
+):
+    """Implementation for migrating rules between instances.
     
-    This command copies rules from the source instance to the destination instance.
-    Only user-created rules (not from feeds) are migrated.
-    
-    Note: This command migrates only the rule definitions, not associated actions
-    or rule exclusions. Use separate commands for those components.
-    
-    Examples:
-        # Migrate all user-created rules
-        sublime migrate rules --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Migrate specific rules by ID
-        sublime migrate rules --include-ids id1,id2 --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Migrate only detection rules
-        sublime migrate rules --type detection --source-api-key KEY1 --dest-api-key KEY2
-        
-        # Preview migration without making changes
-        sublime migrate rules --dry-run --source-api-key KEY1 --dest-api-key KEY2
+    Args:
+        source_api_key: API key for source instance
+        source_region: Region for source instance
+        dest_api_key: API key for destination instance
+        dest_region: Region for destination instance
+        include_rule_ids: Comma-separated list of rule IDs to include
+        exclude_rule_ids: Comma-separated list of rule IDs to exclude
+        rule_type: Filter by rule type (detection or triage)
+        dry_run: If True, preview changes without applying them
+        formatter: Output formatter
     """
-    console = Console()
-    results = {"status": "started", "message": "Migration of Rules"}
-    
-    if output_format == "table":
-        console.print("[bold]Migration of Rules[/]")
-    
+    # Default to table formatter if none provided
+    if formatter is None:
+        formatter = create_formatter("table")
+        
     try:
         # Create API clients for source and destination
-        source_client = get_api_client_from_env_or_args(source_api_key, source_region)
-        dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
+        with formatter.create_progress("Connecting to source and destination instances...") as (progress, task):
+            source_client = get_api_client_from_env_or_args(source_api_key, source_region)
+            dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
+            progress.update(task, advance=1)
         
-        # Build query parameters for API request
+        # Build query parameters for filtering
         params = {
-            "include_deleted": "false",
-            "in_feed": "false"  # Always exclude feed rules
+            "include_deleted": "false"
         }
         
         if rule_type:
             params["type"] = rule_type
         
-        # Fetch rules from source
-        if output_format == "table":
-            with console.status("[blue]Fetching rules from source instance...[/]"):
-                source_response = source_client.get("/v1/rules", params=params)
-        else:
-            source_response = source_client.get("/v1/rules", params=params)
-        
-        # Extract rules from response
-        if "rules" in source_response:
-            source_rules = source_response["rules"]
-        else:
-            source_rules = source_response
+        # Fetch all rules from source with pagination
+        source_rules = fetch_all_rules(source_client, formatter, "source", params)
         
         # Apply ID filters
-        filtered_rules = filter_rules_by_id(source_rules, include_ids, exclude_ids)
+        filtered_rules = filter_rules_by_id(source_rules, include_rule_ids, exclude_rule_ids)
         
         if not filtered_rules:
-            message = "No rules to migrate after applying filters."
-            if output_format == "table":
-                console.print(f"[yellow]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.error("No rules to migrate after applying filters.")
             
-        rules_count_message = f"Found {len(filtered_rules)} rules to migrate."
-        if output_format == "table":
-            console.print(f"[bold]{rules_count_message}[/]")
-        else:
-            results["count"] = len(filtered_rules)
-            results["message"] = rules_count_message
-        
-        # Fetch rules from destination for comparison
-        if output_format == "table":
-            with console.status("[blue]Fetching rules from destination instance...[/]"):
-                dest_response = dest_client.get("/v1/rules", params=params)
-        else:
-            dest_response = dest_client.get("/v1/rules", params=params)
-        
-        # Extract destination rules
-        if "rules" in dest_response:
-            dest_rules = dest_response["rules"]
-        else:
-            dest_rules = dest_response
+        # Fetch all rules from destination with pagination
+        dest_rules = fetch_all_rules(dest_client, formatter, "destination", params)
         
         # Compare and categorize rules
-        new_rules, update_rules, skipped_rules = categorize_rules(filtered_rules, dest_rules)
+        matching_results = match_rules_and_categorize(filtered_rules, dest_rules)
         
-        # Preview changes
+        new_rules = matching_results["new_rules"]
+        update_rules = matching_results["update_rules"]
+        skipped_rules = matching_results["skipped_rules"]
+        
+        # If no rules to migrate, return early
         if not new_rules and not update_rules:
-            message = "No rules to migrate (all rules were skipped or already exist)."
-            if output_format == "table":
-                console.print(f"[yellow]{message}[/]")
-            else:
-                results["status"] = "completed"
-                results["message"] = message
-                click.echo(json.dumps(results, indent=2))
-            return
-            
-        # Prepare preview message
-        preview_message = (
-            f"\nPreparing to migrate {len(new_rules)} new rules and "
-            f"update {len(update_rules)} existing rules."
-        )
+            return CommandResult.success(
+                "No rules to migrate (all rules were skipped or already exist).",
+                {"skipped_rules": len(skipped_rules)}
+            )
         
-        if skipped_rules:
-            preview_message += f" {len(skipped_rules)} rules will be skipped due to content differences."
-            
-        if output_format == "table":
-            console.print(f"[bold]{preview_message}[/]")
-        
-            # Display preview table for rules
-            rules_table = Table(title="Rules to Migrate")
-            rules_table.add_column("ID", style="dim", no_wrap=True)
-            rules_table.add_column("Name", style="green")
-            rules_table.add_column("Type", style="blue")
-            rules_table.add_column("Severity", style="cyan")
-            rules_table.add_column("Status", style="yellow")
-            
-            for rule in new_rules:
-                rules_table.add_row(
-                    rule.get("id", ""),
-                    rule.get("name", ""),
-                    rule.get("type", ""),
-                    rule.get("severity", ""),
-                    "New"
-                )
-            
-            for rule in update_rules:
-                rules_table.add_row(
-                    rule.get("id", ""),
-                    rule.get("name", ""),
-                    rule.get("type", ""),
-                    rule.get("severity", ""),
-                    "Update"
-                )
-            
-            if skipped_rules:
-                for rule in skipped_rules:
-                    rules_table.add_row(
-                        rule.get("id", ""),
-                        rule.get("name", ""),
-                        rule.get("type", ""),
-                        rule.get("severity", ""),
-                        "Skipped - Different content"
-                    )
-            
-            console.print(rules_table)
-        else:
-            # JSON output
-            results["new_rules"] = len(new_rules)
-            results["update_rules"] = len(update_rules)
-            results["skipped_rules"] = len(skipped_rules)
-            results["rules_to_migrate"] = [
+        # Prepare response data
+        migration_data = {
+            "new_rules": [
                 {
                     "id": rule.get("id", ""),
                     "name": rule.get("name", ""),
@@ -190,7 +84,8 @@ def rules(source_api_key, source_region, dest_api_key, dest_region,
                     "status": "New"
                 }
                 for rule in new_rules
-            ] + [
+            ],
+            "update_rules": [
                 {
                     "id": rule.get("id", ""),
                     "name": rule.get("name", ""),
@@ -199,66 +94,120 @@ def rules(source_api_key, source_region, dest_api_key, dest_region,
                     "status": "Update"
                 }
                 for rule in update_rules
+            ],
+            "skipped_rules": [
+                {
+                    "id": rule["rule"].get("id", ""),
+                    "name": rule["rule"].get("name", ""),
+                    "type": rule["rule"].get("type", ""),
+                    "severity": rule["rule"].get("severity", ""),
+                    "reason": rule["reason"]
+                }
+                for rule in skipped_rules
             ]
-            
-            if skipped_rules:
-                results["skipped_details"] = [
-                    {
-                        "id": rule.get("id", ""),
-                        "name": rule.get("name", ""),
-                        "type": rule.get("type", ""),
-                        "severity": rule.get("severity", ""),
-                        "status": "Skipped - Different content"
-                    }
-                    for rule in skipped_rules
-                ]
+        }
         
-        # If dry run, stop here
+        # Add summary stats
+        migration_data["summary"] = {
+            "new_count": len(new_rules),
+            "update_count": len(update_rules),
+            "skipped_count": len(skipped_rules),
+            "total_count": len(new_rules) + len(update_rules) + len(skipped_rules)
+        }
+        
+        # If dry run, return preview data
         if dry_run:
-            dry_run_message = "DRY RUN: No changes were made."
-            if output_format == "table":
-                console.print(f"\n[yellow]{dry_run_message}[/]")
-            else:
-                results["status"] = "dry_run"
-                results["message"] = dry_run_message
-                click.echo(json.dumps(results, indent=2))
-            return
+            return CommandResult.success(
+                "DRY RUN: Preview of rules to migrate",
+                migration_data,
+                "No changes were made to the destination instance."
+            )
         
-        # Ask for confirmation
-        if not yes and output_format == "table" and not Confirm.ask("\nDo you want to proceed with the migration?"):
-            cancel_message = "Migration canceled by user."
-            console.print(f"[yellow]{cancel_message}[/]")
-            return
+        # Show preview before confirmation in interactive mode
+        formatter.output_result(CommandResult.success(
+            "Rules that will be migrated:",
+            migration_data,
+            "Please confirm to proceed with migration."
+        ))
         
-        # Migrate rules
-        rule_results = migrate_rules(
-            console, dest_client, new_rules, update_rules, dest_rules, output_format
+        # Confirm migration if interactive
+        if not formatter.prompt_confirmation("\nDo you want to proceed with the migration?"):
+            return CommandResult.success("Migration canceled by user.")
+        
+        # Perform the migration
+        results = perform_migration(formatter, dest_client, new_rules, update_rules, dest_rules)
+        
+        # Add results to migration data
+        migration_data["results"] = results
+        
+        # Return overall results
+        return CommandResult.success(
+            f"Migration completed: {results['created']} created, {results['updated']} updated, "
+            f"{results['skipped']} skipped, {results['failed']} failed",
+            migration_data,
+            "See details below for operation results."
         )
-        
-        # Display results
-        results_message = (
-            f"Migration completed: {rule_results['created']} rules created, "
-            f"{rule_results['updated']} rules updated, "
-            f"{rule_results['skipped']} rules skipped, "
-            f"{rule_results['failed']} rules failed"
-        )
-        
-        if output_format == "table":
-            console.print(f"\n[bold green]{results_message}[/]")
-        else:
-            results["status"] = "completed"
-            results["message"] = results_message
-            results["details"] = rule_results
-            click.echo(json.dumps(results, indent=2))
         
     except Exception as e:
-        error_message = f"Error during migration: {str(e)}"
-        if output_format == "table":
-            console.print(f"[bold red]{error_message}[/]")
-        else:
-            results["status"] = "error"
-            results["error"] = error_message
-            click.echo(json.dumps(results, indent=2))
+        return CommandResult.error(f"Error during migration: {str(e)}")
+
+
+def fetch_all_rules(client, formatter, instance_name, params=None):
+    """Fetch all rules from an instance with pagination.
+    
+    Args:
+        client: API client for the instance
+        formatter: Output formatter
+        instance_name: Name of the instance (for display)
+        params: Optional query parameters
+        
+    Returns:
+        List[Dict]: All rules from the instance
+    """
+    all_rules = []
+    offset = 0
+    limit = 100
+    total = None
+    
+    params = params or {}
+    params["limit"] = limit
+    params["in_feed"] = False
+    
+    with formatter.create_progress(f"Fetching rules from {instance_name}...") as (progress, task):
+        # Continue fetching until we have all rules
+        while True:
+            # Update offset for pagination
+            page_params = params.copy()
+            page_params["offset"] = offset
+            
+            # Fetch a page of rules
+            page = client.get("/v1/rules", params=page_params)
+            
+            # Extract rules from the response
+            if "rules" in page:
+                page_rules = page.get("rules", [])
+                count = page.get("count", 0)
+                total_rules = page.get("total", 0)
+            else:
+                page_rules = page
+                count = len(page_rules)
+                total_rules = count
+            
+            # Add rules to our collection
+            all_rules.extend(page_rules)
+            
+            # Update progress if we know the total
+            if total_rules and task:
+                progress.update(task, total=total_rules, completed=len(all_rules))
+            
+            # Check if we've fetched all rules
+            if len(all_rules) >= total_rules or len(page_rules) == 0:
+                break
+            
+            # Update offset for next page
+            offset += limit
+    
+    return all_rules
 
 
 def filter_rules_by_id(rules: List[Dict], include_ids: Optional[str], exclude_ids: Optional[str]) -> List[Dict]:
@@ -286,28 +235,23 @@ def filter_rules_by_id(rules: List[Dict], include_ids: Optional[str], exclude_id
     return filtered
 
 
-def categorize_rules(source_rules: List[Dict], dest_rules: List[Dict]) -> tuple:
-    """Categorize rules as new, update, or skipped based on matching.
-    
-    Matches rules based on name and source_md5 to ensure we're updating
-    the correct rules. Rules with matching names but different source_md5
-    will be skipped.
+def match_rules_and_categorize(source_rules: List[Dict], dest_rules: List[Dict]) -> Dict:
+    """Match rules between source and destination and categorize them.
     
     Args:
-        source_rules: List of source rule objects
-        dest_rules: List of destination rule objects
+        source_rules: List of source rules
+        dest_rules: List of destination rules
         
     Returns:
-        tuple: (new_rules, update_rules, skipped_rules)
+        Dict: Results of matching including rules to create, update, and skip
     """
     # Create lookup dicts for destination rules
     dest_rule_by_name = {rule.get("name"): rule for rule in dest_rules}
-    # print(dest_rule_by_name)
     dest_rule_by_name_and_md5 = {
         (rule.get("name"), rule.get("source_md5")): rule 
         for rule in dest_rules
     }
-    print(dest_rule_by_name_and_md5)
+    
     new_rules = []
     update_rules = []
     skipped_rules = []
@@ -322,29 +266,34 @@ def categorize_rules(source_rules: List[Dict], dest_rules: List[Dict]) -> tuple:
             update_rules.append(rule)
         elif rule_name in dest_rule_by_name:
             # Name match but different source - skip
-            skipped_rules.append(rule)
+            skipped_rules.append({
+                "rule": rule,
+                "reason": "Rule exists with same name but different content (source_md5 mismatch)"
+            })
         else:
             # No match - new rule
             new_rules.append(rule)
     
-    return new_rules, update_rules, skipped_rules
+    return {
+        "new_rules": new_rules,
+        "update_rules": update_rules,
+        "skipped_rules": skipped_rules
+    }
 
 
-def migrate_rules(console: Console, dest_client, new_rules: List[Dict], 
-                 update_rules: List[Dict], existing_rules: List[Dict],
-                 output_format: str) -> Dict:
-    """Migrate rules to the destination instance.
+def perform_migration(formatter, dest_client, new_rules: List[Dict], 
+                     update_rules: List[Dict], existing_rules: List[Dict]) -> Dict:
+    """Perform the actual migration of rules to the destination.
     
     Args:
-        console: Rich console for output
-        dest_client: API client for the destination
+        formatter: Output formatter
+        dest_client: API client for destination
         new_rules: List of new rules to create
-        update_rules: List of rules to potentially update
-        existing_rules: List of existing rules in the destination
-        output_format: Output format
+        update_rules: List of rules to update
+        existing_rules: List of existing rules
         
     Returns:
-        Dict: Migration results
+        Dict: Results of the migration
     """
     results = {
         "created": 0,
@@ -359,44 +308,22 @@ def migrate_rules(console: Console, dest_client, new_rules: List[Dict],
     
     # Process new rules
     if new_rules:
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Creating new rules..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Creating", total=len(new_rules))
-                
-                for rule in new_rules:
-                    process_new_rule(rule, dest_client, results, console)
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode - no progress indicators
+        with formatter.create_progress("Creating new rules...", total=len(new_rules)) as (progress, task):
             for rule in new_rules:
-                process_new_rule(rule, dest_client, results, console)
+                process_new_rule(rule, dest_client, results)
+                progress.update(task, advance=1)
     
     # Process updates
     if update_rules:
-        if output_format == "table":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Updating existing rules..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Updating", total=len(update_rules))
-                
-                for rule in update_rules:
-                    process_update_rule(rule, dest_client, existing_map, results, console)
-                    progress.update(task, advance=1)
-        else:
-            # JSON output mode - no progress indicators
+        with formatter.create_progress("Updating existing rules...", total=len(update_rules)) as (progress, task):
             for rule in update_rules:
-                process_update_rule(rule, dest_client, existing_map, results, console)
+                process_update_rule(rule, dest_client, existing_map, results)
+                progress.update(task, advance=1)
     
     return results
 
 
-def process_new_rule(rule: Dict, dest_client, results: Dict, console: Console):
+def process_new_rule(rule: Dict, dest_client, results: Dict):
     """Process a new rule for migration."""
     rule_name = rule.get("name", "")
     try:
@@ -408,6 +335,7 @@ def process_new_rule(rule: Dict, dest_client, results: Dict, console: Console):
         results["created"] += 1
         results["details"].append({
             "name": rule_name,
+            "type": rule.get("type", ""),
             "status": "created"
         })
         
@@ -415,14 +343,13 @@ def process_new_rule(rule: Dict, dest_client, results: Dict, console: Console):
         results["failed"] += 1
         results["details"].append({
             "name": rule_name,
+            "type": rule.get("type", ""),
             "status": "failed",
             "reason": str(e)
         })
-        console.print(f"[red]Failed to create rule '{rule_name}': {str(e)}[/]")
 
 
-def process_update_rule(rule: Dict, dest_client, existing_map: Dict[str, Dict], 
-                       results: Dict, console: Console):
+def process_update_rule(rule: Dict, dest_client, existing_map: Dict[str, Dict], results: Dict):
     """Process a rule update for migration."""
     rule_name = rule.get("name", "")
     existing = existing_map.get(rule_name)
@@ -431,6 +358,7 @@ def process_update_rule(rule: Dict, dest_client, existing_map: Dict[str, Dict],
         results["skipped"] += 1
         results["details"].append({
             "name": rule_name,
+            "type": rule.get("type", ""),
             "status": "skipped",
             "reason": "Rule not found in destination"
         })
@@ -445,6 +373,7 @@ def process_update_rule(rule: Dict, dest_client, existing_map: Dict[str, Dict],
         results["updated"] += 1
         results["details"].append({
             "name": rule_name,
+            "type": rule.get("type", ""),
             "status": "updated"
         })
             
@@ -452,10 +381,10 @@ def process_update_rule(rule: Dict, dest_client, existing_map: Dict[str, Dict],
         results["failed"] += 1
         results["details"].append({
             "name": rule_name,
+            "type": rule.get("type", ""),
             "status": "failed",
             "reason": str(e)
         })
-        console.print(f"[red]Failed to update rule '{rule_name}': {str(e)}[/]")
 
 
 def create_rule_payload(rule: Dict) -> Dict:
@@ -489,3 +418,65 @@ def create_rule_payload(rule: Dict) -> Dict:
             payload[field] = rule[field]
     
     return payload
+
+
+# Click command definition
+@click.command()
+@click.option("--source-api-key", help="API key for the source instance")
+@click.option("--source-region", help="Region of the source instance")
+@click.option("--dest-api-key", help="API key for the destination instance")
+@click.option("--dest-region", help="Region of the destination instance")
+@click.option("--include-rule-ids", help="Comma-separated list of rule IDs to include")
+@click.option("--exclude-rule-ids", help="Comma-separated list of rule IDs to exclude")
+@click.option("--type", "rule_type", type=click.Choice(["detection", "triage"]), 
+              help="Filter by rule type (detection or triage)")
+@click.option("--dry-run", is_flag=True, help="Preview changes without applying them")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+@click.option("--format", "output_format", type=click.Choice(["table", "json"]), default="table",
+              help="Output format (table or json)")
+def rules(source_api_key, source_region, dest_api_key, dest_region,
+          include_rule_ids, exclude_rule_ids, rule_type, dry_run, yes, output_format):
+    """Migrate rules between Sublime Security instances.
+    
+    This command copies rules from the source instance to the destination instance.
+    Only user-created rules (not from feeds) are migrated.
+    
+    Note: This command migrates only the rule definitions, not associated actions
+    or rule exclusions. Use separate commands for those components.
+    
+    Examples:
+        # Migrate all user-created rules
+        sublime migrate rules --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Migrate specific rules by ID
+        sublime migrate rules --include-rule-ids id1,id2 --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Migrate only detection rules
+        sublime migrate rules --type detection --source-api-key KEY1 --dest-api-key KEY2
+        
+        # Preview migration without making changes
+        sublime migrate rules --dry-run --source-api-key KEY1 --dest-api-key KEY2
+    """
+    # Create formatter based on output format
+    formatter = create_formatter(output_format)
+    
+    # If --yes flag is provided, modify the formatter to auto-confirm
+    if yes:
+        original_prompt = formatter.prompt_confirmation
+        formatter.prompt_confirmation = lambda _: True
+    
+    # Execute the implementation function
+    result = migrate_rules_between_instances(
+        source_api_key, source_region, 
+        dest_api_key, dest_region,
+        include_rule_ids, exclude_rule_ids, 
+        rule_type,
+        dry_run, formatter
+    )
+    
+    # Reset the formatter if it was modified
+    if yes and hasattr(formatter, 'original_prompt'):
+        formatter.prompt_confirmation = original_prompt
+    
+    # Output the result
+    formatter.output_result(result)
