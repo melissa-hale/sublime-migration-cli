@@ -110,6 +110,19 @@ class InteractiveFormatter(OutputFormatter):
         if hasattr(data, "__class__") and data.__class__.__name__ == "Rule":
             self._output_rule(data)
             return
+        
+        # Check for model objects by looking for to_dict method
+        if hasattr(data, "to_dict") and callable(getattr(data, "to_dict")):
+            # Convert model to dictionary and display as a property table
+            self._output_property_table(data.to_dict())
+            return
+        
+        # Handle lists of model objects
+        if isinstance(data, list) and data and hasattr(data[0], "to_dict") and callable(getattr(data[0], "to_dict")):
+            # Convert list of models to list of dictionaries
+            dict_list = [item.to_dict() for item in data]
+            self._output_table_from_dict_list(dict_list)
+            return
             
         if isinstance(data, list) and data and hasattr(data[0], "__class__") and data[0].__class__.__name__ == "Rule":
             self._output_rules_list(data)
@@ -134,6 +147,11 @@ class InteractiveFormatter(OutputFormatter):
                 "new_actions", "new_lists", "new_exclusions", "new_feeds", "new_rules", "rules_to_update"
             ]) and "summary" in data:
             self._output_migration_preview(data)
+            return
+        
+        # Check for migration plan data
+        if isinstance(data, dict) and "migration_plan" in data:
+            self._output_migration_plan(data)
             return
     
     def _output_table(self, table: Table) -> None:
