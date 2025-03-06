@@ -1,10 +1,17 @@
-"""Refactored commands for migrating exclusions between Sublime Security instances."""
+"""Refactored commands for migrating exclusions using utility functions."""
 from typing import Dict, List, Optional, Set
 import click
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import filter_by_ids, filter_by_creator
+from sublime_migration_cli.utils.errors import (
+    ApiError, MigrationError, handle_api_error, ErrorHandler
+)
 
 # Authors to exclude from migration (system and built-in exclusions)
 EXCLUDED_AUTHORS = {"Sublime Security", "System"}
@@ -42,29 +49,36 @@ def migrate_exclusions_between_instances(
             dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
             progress.update(task, advance=1)
         
-        # Fetch exclusions from source (only global exclusions, not rule exclusions)
+        # Prepare parameters for fetching exclusions
         params = {
             "include_deleted": "false",
             "scope": ["detection_exclusion", "exclusion"]  # Only global exclusions
         }
         
-        with formatter.create_progress("Fetching exclusions from source...") as (progress, task):
-            response = source_client.get("/v1/exclusions", params=params)
-            
-            # The API returns a nested object with an "exclusions" key
-            if "exclusions" in response:
-                source_exclusions = response["exclusions"]
-            else:
-                source_exclusions = response  # Fallback if structure changes
-            
-            progress.update(task, advance=1)
+        # Use PaginatedFetcher to fetch exclusions from source
+        source_fetcher = PaginatedFetcher(source_client, formatter)
+        source_exclusions = source_fetcher.fetch_all(
+            "/v1/exclusions",
+            params=params,
+            progress_message="Fetching exclusions from source...",
+            # Custom extractors for the exclusions endpoint
+            result_extractor=lambda resp: resp.get("exclusions", []) if isinstance(resp, dict) else resp,
+            total_extractor=lambda resp: len(resp.get("exclusions", [])) if isinstance(resp, dict) else len(resp)
+        )
         
-        # Apply filters
-        filtered_exclusions = filter_exclusions(
-            source_exclusions, 
-            include_ids, 
-            exclude_ids, 
-            include_system_created
+        # Apply filters using our utility functions
+        # First filter by creator
+        filtered_exclusions = filter_by_creator(
+            source_exclusions,
+            include_system_created,
+            EXCLUDED_AUTHORS
+        )
+        
+        # Then apply ID filters
+        filtered_exclusions = filter_by_ids(
+            filtered_exclusions,
+            include_ids,
+            exclude_ids
         )
         
         if not filtered_exclusions:
@@ -126,39 +140,11 @@ def migrate_exclusions_between_instances(
         )
         
     except Exception as e:
-        return CommandResult.error(f"Error during migration: {str(e)}")
-
-
-def filter_exclusions(exclusions: List[Dict], include_ids: Optional[str], 
-                     exclude_ids: Optional[str], include_system_created: bool) -> List[Dict]:
-    """Filter exclusions based on the provided criteria.
-    
-    Args:
-        exclusions: List of exclusion objects
-        include_ids: Comma-separated list of exclusion IDs to include
-        exclude_ids: Comma-separated list of exclusion IDs to exclude
-        include_system_created: Include system-created exclusions
-        
-    Returns:
-        List[Dict]: Filtered exclusion objects
-    """
-    filtered = exclusions
-    
-    # Filter out system-created exclusions unless include_system_created is True
-    if not include_system_created:
-        filtered = [exc for exc in filtered if exc.get("created_by_user_name") not in EXCLUDED_AUTHORS and
-                    exc.get("created_by_org_name") not in EXCLUDED_AUTHORS]
-    
-    # Filter by IDs
-    if include_ids:
-        ids = [id.strip() for id in include_ids.split(",")]
-        filtered = [exc for exc in filtered if exc.get("id") in ids]
-        
-    if exclude_ids:
-        ids = [id.strip() for id in exclude_ids.split(",")]
-        filtered = [exc for exc in filtered if exc.get("id") not in ids]
-    
-    return filtered
+        sublime_error = handle_api_error(e)
+        if isinstance(sublime_error, ApiError):
+            return CommandResult.error(f"API error during migration: {sublime_error.message}", sublime_error.details)
+        else:
+            return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
 def perform_migration(formatter, dest_client, exclusions: List[Dict]) -> Dict:
@@ -179,9 +165,9 @@ def perform_migration(formatter, dest_client, exclusions: List[Dict]) -> Dict:
     }
     
     with formatter.create_progress("Creating exclusions...", total=len(exclusions)) as (progress, task):
-        for exclusion in exclusions:
+        for i, exclusion in enumerate(exclusions):
             process_exclusion(exclusion, dest_client, results)
-            progress.update(task, advance=1)
+            progress.update(task, completed=i+1)
     
     return results
 
@@ -204,13 +190,22 @@ def process_exclusion(exclusion: Dict, dest_client, results: Dict):
             "status": "created"
         })
         
-    except Exception as e:
+    except ApiError as e:
         results["failed"] += 1
         results["details"].append({
             "name": exclusion_name,
             "type": exclusion_scope,
             "status": "failed",
-            "reason": str(e)
+            "reason": e.message
+        })
+    except Exception as e:
+        sublime_error = handle_api_error(e)
+        results["failed"] += 1
+        results["details"].append({
+            "name": exclusion_name,
+            "type": exclusion_scope,
+            "status": "failed",
+            "reason": str(sublime_error.message)
         })
 
 

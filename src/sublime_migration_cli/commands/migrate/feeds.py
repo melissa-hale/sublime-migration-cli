@@ -1,10 +1,17 @@
-"""Refactored commands for migrating feeds between Sublime Security instances."""
+"""Refactored commands for migrating feeds using utility functions."""
 from typing import Dict, List, Optional, Set
 import click
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import filter_by_ids, filter_by_creator
+from sublime_migration_cli.utils.errors import (
+    ApiError, MigrationError, handle_api_error, ErrorHandler
+)
 
 
 # Implementation functions
@@ -39,34 +46,38 @@ def migrate_feeds_between_instances(
             dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
             progress.update(task, advance=1)
         
-        # Fetch feeds from source
-        with formatter.create_progress("Fetching feeds from source instance...") as (progress, task):
-            response = source_client.get("/v1/feeds")
-            
-            # The API returns a nested object with a "feeds" key
-            if "feeds" in response:
-                source_feeds = response["feeds"]
-            else:
-                source_feeds = response  # Fallback if structure changes
-                
-            progress.update(task, advance=1)
+        # Use PaginatedFetcher to fetch feeds from source
+        source_fetcher = PaginatedFetcher(source_client, formatter)
+        source_feeds = source_fetcher.fetch_all(
+            "/v1/feeds",
+            progress_message="Fetching feeds from source...",
+            # Custom extractors for the feeds endpoint
+            result_extractor=lambda resp: resp.get("feeds", []) if isinstance(resp, dict) else resp,
+            total_extractor=lambda resp: len(resp.get("feeds", [])) if isinstance(resp, dict) else len(resp)
+        )
         
-        # Apply filters
-        filtered_feeds = filter_feeds(source_feeds, include_ids, exclude_ids, include_system)
+        # Apply filters to feeds
+        # First, filter by system vs. user feeds
+        if not include_system:
+            filtered_feeds = [feed for feed in source_feeds if not feed.get("is_system", False)]
+        else:
+            filtered_feeds = source_feeds
+        
+        # Then apply ID filters
+        filtered_feeds = filter_by_ids(filtered_feeds, include_ids, exclude_ids)
         
         if not filtered_feeds:
             return CommandResult.error("No feeds to migrate after applying filters.")
             
-        # Fetch feeds from destination for comparison
-        with formatter.create_progress("Fetching feeds from destination instance...") as (progress, task):
-            response = dest_client.get("/v1/feeds")
-            
-            if "feeds" in response:
-                dest_feeds = response["feeds"]
-            else:
-                dest_feeds = response
-                
-            progress.update(task, advance=1)
+        # Use PaginatedFetcher to fetch feeds from destination
+        dest_fetcher = PaginatedFetcher(dest_client, formatter)
+        dest_feeds = dest_fetcher.fetch_all(
+            "/v1/feeds",
+            progress_message="Fetching feeds from destination...",
+            # Custom extractors for the feeds endpoint
+            result_extractor=lambda resp: resp.get("feeds", []) if isinstance(resp, dict) else resp,
+            total_extractor=lambda resp: len(resp.get("feeds", [])) if isinstance(resp, dict) else len(resp)
+        )
         
         # Compare and categorize feeds
         new_feeds, update_feeds = categorize_feeds(filtered_feeds, dest_feeds)
@@ -142,38 +153,11 @@ def migrate_feeds_between_instances(
         )
         
     except Exception as e:
-        return CommandResult.error(f"Error during migration: {str(e)}")
-
-
-def filter_feeds(feeds: List[Dict], include_ids: Optional[str], 
-                exclude_ids: Optional[str], include_system: bool) -> List[Dict]:
-    """Filter feeds based on the provided criteria.
-    
-    Args:
-        feeds: List of feed objects
-        include_ids: Comma-separated list of feed IDs to include
-        exclude_ids: Comma-separated list of feed IDs to exclude
-        include_system: Include system feeds
-        
-    Returns:
-        List[Dict]: Filtered feed objects
-    """
-    filtered = feeds
-    
-    # Filter out system feeds unless include_system is True
-    if not include_system:
-        filtered = [feed for feed in filtered if not feed.get("is_system", False)]
-    
-    # Filter by IDs
-    if include_ids:
-        ids = [id.strip() for id in include_ids.split(",")]
-        filtered = [feed for feed in filtered if feed.get("id") in ids]
-        
-    if exclude_ids:
-        ids = [id.strip() for id in exclude_ids.split(",")]
-        filtered = [feed for feed in filtered if feed.get("id") not in ids]
-    
-    return filtered
+        sublime_error = handle_api_error(e)
+        if isinstance(sublime_error, ApiError):
+            return CommandResult.error(f"API error during migration: {sublime_error.message}", sublime_error.details)
+        else:
+            return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
 def categorize_feeds(source_feeds: List[Dict], dest_feeds: List[Dict]) -> tuple:
@@ -230,16 +214,16 @@ def perform_migration(formatter, dest_client, new_feeds: List[Dict],
     # Process new feeds
     if new_feeds:
         with formatter.create_progress("Creating new feeds...", total=len(new_feeds)) as (progress, task):
-            for feed in new_feeds:
+            for i, feed in enumerate(new_feeds):
                 process_new_feed(feed, dest_client, results)
-                progress.update(task, advance=1)
+                progress.update(task, completed=i+1)
     
     # Process updates
     if update_feeds:
         with formatter.create_progress("Updating existing feeds...", total=len(update_feeds)) as (progress, task):
-            for feed in update_feeds:
+            for i, feed in enumerate(update_feeds):
                 process_update_feed(feed, dest_client, existing_map, results)
-                progress.update(task, advance=1)
+                progress.update(task, completed=i+1)
     
     return results
 
@@ -260,13 +244,22 @@ def process_new_feed(feed: Dict, dest_client, results: Dict):
             "status": "created"
         })
         
-    except Exception as e:
+    except ApiError as e:
         results["failed"] += 1
         results["details"].append({
             "name": feed_name,
             "type": "feed",
             "status": "failed",
-            "reason": str(e)
+            "reason": e.message
+        })
+    except Exception as e:
+        sublime_error = handle_api_error(e)
+        results["failed"] += 1
+        results["details"].append({
+            "name": feed_name,
+            "type": "feed",
+            "status": "failed",
+            "reason": str(sublime_error.message)
         })
 
 
@@ -316,13 +309,22 @@ def process_update_feed(feed: Dict, dest_client, existing_map: Dict[str, Dict], 
                 "reason": "No changes needed"
             })
                 
-    except Exception as e:
+    except ApiError as e:
         results["failed"] += 1
         results["details"].append({
             "name": feed_name,
             "type": "feed",
             "status": "failed",
-            "reason": str(e)
+            "reason": e.message
+        })
+    except Exception as e:
+        sublime_error = handle_api_error(e)
+        results["failed"] += 1
+        results["details"].append({
+            "name": feed_name,
+            "type": "feed",
+            "status": "failed",
+            "reason": str(sublime_error.message)
         })
 
 

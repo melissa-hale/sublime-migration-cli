@@ -1,10 +1,15 @@
-"""Refactored command to migrate all components between Sublime Security instances."""
+"""Refactored command to migrate all components using utility functions."""
 import time
 import click
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.errors import (
+    ApiError, MigrationError, handle_api_error, ErrorHandler
+)
 
 # Import all the refactored migration commands
 from sublime_migration_cli.commands.migrate.actions import migrate_actions_between_instances
@@ -46,7 +51,7 @@ def migrate_all_components_between_instances(
             source_client = get_api_client_from_env_or_args(source_api_key, source_region)
             dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
             
-            # Test connection
+            # Test connection by fetching user info
             source_info = source_client.get("/v1/me")
             dest_info = dest_client.get("/v1/me")
             
@@ -175,17 +180,18 @@ def migrate_all_components_between_instances(
                 }
                 
             except Exception as e:
-                # Record error
-                error_message = f"Error during {step_title} migration: {str(e)}"
+                # Handle and record error
+                sublime_error = handle_api_error(e)
+                error_message = f"Error during {step_title} migration: {sublime_error.message}"
                 formatter.output_error(error_message)
                 
                 overall_results[step_name] = {
                     "status": "error",
-                    "message": str(e)
+                    "message": sublime_error.message
                 }
                 migration_data["steps_results"][step_name] = {
                     "status": "error",
-                    "error": str(e)
+                    "error": sublime_error.message
                 }
             
             # Add a pause between steps
@@ -216,7 +222,11 @@ def migrate_all_components_between_instances(
         )
         
     except Exception as e:
-        return CommandResult.error(f"Error during migration: {str(e)}")
+        sublime_error = handle_api_error(e)
+        if isinstance(sublime_error, ApiError):
+            return CommandResult.error(f"API error during migration: {sublime_error.message}", sublime_error.details)
+        else:
+            return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
 # Click command definition

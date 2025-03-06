@@ -1,4 +1,4 @@
-"""Refactored commands for migrating rule exclusions between Sublime Security instances."""
+"""Refactored commands for migrating rule exclusions using utility functions."""
 from typing import Dict, List, Optional, Set, Tuple
 import re
 import click
@@ -6,6 +6,13 @@ import click
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import filter_by_ids
+from sublime_migration_cli.utils.errors import (
+    ApiError, MigrationError, handle_api_error, ErrorHandler
+)
 
 
 # Regular expression patterns for different types of exclusions
@@ -46,26 +53,34 @@ def migrate_rule_exclusions_between_instances(
             dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
             progress.update(task, advance=1)
             
-        # Fetch all rules from source with pagination
-        source_rules = fetch_all_rules(source_client, formatter, "source")
+        # Use PaginatedFetcher to fetch all rules from source
+        source_fetcher = PaginatedFetcher(source_client, formatter)
+        source_rules = source_fetcher.fetch_all(
+            "/v1/rules",
+            progress_message="Fetching rules from source..."
+        )
         
-        # Apply rule ID filters
-        filtered_rules = filter_rules_by_id(source_rules, include_rule_ids, exclude_rule_ids)
+        # Apply rule ID filters using our utility function
+        filtered_rules = filter_by_ids(source_rules, include_rule_ids, exclude_rule_ids)
         
         # Fetch detailed rule information including exclusions
         with formatter.create_progress("Fetching rule details for exclusions...", total=len(filtered_rules)) as (progress, task):
             detailed_rules = []
             
-            for rule in filtered_rules:
+            for i, rule in enumerate(filtered_rules):
                 try:
                     rule_id = rule.get("id")
                     # Fetch detailed info
                     details = source_client.get(f"/v1/rules/{rule_id}")
                     detailed_rules.append(details)
+                except ApiError as e:
+                    formatter.output_error(f"Warning: Failed to fetch details for rule '{rule.get('name')}': {e.message}")
                 except Exception as e:
-                    formatter.output_error(f"Warning: Failed to fetch details for rule '{rule.get('name')}': {str(e)}")
+                    sublime_error = handle_api_error(e)
+                    formatter.output_error(f"Warning: Failed to fetch details for rule '{rule.get('name')}': {sublime_error.message}")
                 
-                progress.update(task, advance=1)
+                # Update progress
+                progress.update(task, completed=i+1)
         
         # Filter to only rules with exclusions
         rules_with_exclusions = [
@@ -76,8 +91,12 @@ def migrate_rule_exclusions_between_instances(
         if not rules_with_exclusions:
             return CommandResult.error("No rules with exclusions found after applying filters.")
             
-        # Fetch all rules from destination with pagination
-        dest_rules = fetch_all_rules(dest_client, formatter, "destination")
+        # Use PaginatedFetcher to fetch all rules from destination
+        dest_fetcher = PaginatedFetcher(dest_client, formatter)
+        dest_rules = dest_fetcher.fetch_all(
+            "/v1/rules",
+            progress_message="Fetching rules from destination..."
+        )
         
         # Create mapping of rules by name and md5 in destination
         dest_rules_map = {
@@ -180,89 +199,11 @@ def migrate_rule_exclusions_between_instances(
         )
         
     except Exception as e:
-        return CommandResult.error(f"Error during migration: {str(e)}")
-
-
-def fetch_all_rules(client, formatter, instance_name, params=None):
-    """Fetch all rules from an instance with pagination.
-    
-    Args:
-        client: API client for the instance
-        formatter: Output formatter
-        instance_name: Name of the instance (for display)
-        params: Optional query parameters
-        
-    Returns:
-        List[Dict]: All rules from the instance
-    """
-    all_rules = []
-    offset = 0
-    limit = 100
-    total = None
-    
-    params = params or {}
-    params["limit"] = limit
-    
-    with formatter.create_progress(f"Fetching rules from {instance_name}...") as (progress, task):
-        # Continue fetching until we have all rules
-        while True:
-            # Update offset for pagination
-            page_params = params.copy()
-            page_params["offset"] = offset
-            
-            # Fetch a page of rules
-            page = client.get("/v1/rules", params=page_params)
-            
-            # Extract rules from the response
-            if "rules" in page:
-                page_rules = page.get("rules", [])
-                count = page.get("count", 0)
-                total_rules = page.get("total", 0)
-            else:
-                page_rules = page
-                count = len(page_rules)
-                total_rules = count
-            
-            # Add rules to our collection
-            all_rules.extend(page_rules)
-            
-            # Update progress if we know the total
-            if total_rules and task:
-                progress.update(task, total=total_rules, completed=len(all_rules))
-            
-            # Check if we've fetched all rules
-            if len(all_rules) >= total_rules or len(page_rules) == 0:
-                break
-            
-            # Update offset for next page
-            offset += limit
-    
-    return all_rules
-
-
-def filter_rules_by_id(rules: List[Dict], include_ids: Optional[str], exclude_ids: Optional[str]) -> List[Dict]:
-    """Filter rules based on ID.
-    
-    Args:
-        rules: List of rule objects
-        include_ids: Comma-separated list of rule IDs to include
-        exclude_ids: Comma-separated list of rule IDs to exclude
-        
-    Returns:
-        List[Dict]: Filtered rule objects
-    """
-    filtered = rules
-    
-    # Filter by IDs
-    if include_ids:
-        ids = [id.strip() for id in include_ids.split(",")]
-        filtered = [rule for rule in filtered if rule.get("id") in ids]
-        
-    if exclude_ids:
-        ids = [id.strip() for id in exclude_ids.split(",")]
-        filtered = [rule for rule in filtered if rule.get("id") not in ids]
-    
-    return filtered
+        sublime_error = handle_api_error(e)
+        if isinstance(sublime_error, ApiError):
+            return CommandResult.error(f"API error during migration: {sublime_error.message}", sublime_error.details)
+        else:
+            return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
 def match_rules_and_parse_exclusions(source_rules: List[Dict], dest_rules_map: Dict) -> Dict:
@@ -359,9 +300,9 @@ def apply_rule_exclusions(formatter, dest_client, rules_to_update: List[Dict]) -
     }
     
     with formatter.create_progress("Updating rule exclusions...", total=len(rules_to_update)) as (progress, task):
-        for rule_update in rules_to_update:
+        for i, rule_update in enumerate(rules_to_update):
             process_rule_exclusion_update(rule_update, dest_client, results)
-            progress.update(task, advance=1)
+            progress.update(task, completed=i+1)
     
     return results
 
@@ -386,13 +327,21 @@ def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict)
                 # Add exclusion to rule
                 dest_client.post(f"/v1/rules/{dest_rule_id}/add-exclusion", exclusion)
                 succeeded += 1
-            except Exception as e:
+            except ApiError as e:
                 # Record failure but continue with others
                 results["details"].append({
                     "name": rule_name,
                     "type": "exclusion",
                     "status": "failed",
-                    "reason": f"Failed to add exclusion {exclusion}: {str(e)}"
+                    "reason": f"Failed to add exclusion {exclusion}: {e.message}"
+                })
+            except Exception as e:
+                sublime_error = handle_api_error(e)
+                results["details"].append({
+                    "name": rule_name,
+                    "type": "exclusion",
+                    "status": "failed",
+                    "reason": f"Failed to add exclusion {exclusion}: {sublime_error.message}"
                 })
         
         if succeeded > 0:
@@ -412,13 +361,22 @@ def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict)
                 "reason": "All exclusions failed to apply"
             })
         
-    except Exception as e:
+    except ApiError as e:
         results["failed"] += 1
         results["details"].append({
             "name": rule_name,
             "type": "rule",
             "status": "failed",
-            "reason": str(e)
+            "reason": e.message
+        })
+    except Exception as e:
+        sublime_error = handle_api_error(e)
+        results["failed"] += 1
+        results["details"].append({
+            "name": rule_name,
+            "type": "rule",
+            "status": "failed",
+            "reason": str(sublime_error.message)
         })
 
 
