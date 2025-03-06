@@ -1,10 +1,17 @@
-"""Refactored commands for migrating rules between Sublime Security instances."""
+"""Refactored commands for migrating rules using utility functions."""
 from typing import Dict, List, Optional, Set
 import click
 
 from sublime_migration_cli.api.client import get_api_client_from_env_or_args
 from sublime_migration_cli.presentation.base import CommandResult
 from sublime_migration_cli.presentation.factory import create_formatter
+
+# Import our utility functions
+from sublime_migration_cli.utils.api import PaginatedFetcher
+from sublime_migration_cli.utils.filtering import filter_by_ids
+from sublime_migration_cli.utils.errors import (
+    ApiError, MigrationError, handle_api_error, ErrorHandler
+)
 
 
 # Implementation functions
@@ -41,23 +48,34 @@ def migrate_rules_between_instances(
         
         # Build query parameters for filtering
         params = {
-            "include_deleted": "false"
+            "include_deleted": "false",
+            "in_feed": "false"
         }
         
         if rule_type:
             params["type"] = rule_type
         
-        # Fetch all rules from source with pagination
-        source_rules = fetch_all_rules(source_client, formatter, "source", params)
+        # Use PaginatedFetcher to fetch all rules from source with pagination
+        source_fetcher = PaginatedFetcher(source_client, formatter)
+        source_rules = source_fetcher.fetch_all(
+            "/v1/rules",
+            params=params,
+            progress_message="Fetching rules from source..."
+        )
         
-        # Apply ID filters
-        filtered_rules = filter_rules_by_id(source_rules, include_rule_ids, exclude_rule_ids)
+        # Apply ID filters using our utility function
+        filtered_rules = filter_by_ids(source_rules, include_rule_ids, exclude_rule_ids)
         
         if not filtered_rules:
             return CommandResult.error("No rules to migrate after applying filters.")
             
-        # Fetch all rules from destination with pagination
-        dest_rules = fetch_all_rules(dest_client, formatter, "destination", params)
+        # Use PaginatedFetcher to fetch all rules from destination 
+        dest_fetcher = PaginatedFetcher(dest_client, formatter)
+        dest_rules = dest_fetcher.fetch_all(
+            "/v1/rules",
+            params=params,
+            progress_message="Fetching rules from destination..."
+        )
         
         # Compare and categorize rules
         matching_results = match_rules_and_categorize(filtered_rules, dest_rules)
@@ -149,90 +167,11 @@ def migrate_rules_between_instances(
         )
         
     except Exception as e:
-        return CommandResult.error(f"Error during migration: {str(e)}")
-
-
-def fetch_all_rules(client, formatter, instance_name, params=None):
-    """Fetch all rules from an instance with pagination.
-    
-    Args:
-        client: API client for the instance
-        formatter: Output formatter
-        instance_name: Name of the instance (for display)
-        params: Optional query parameters
-        
-    Returns:
-        List[Dict]: All rules from the instance
-    """
-    all_rules = []
-    offset = 0
-    limit = 100
-    total = None
-    
-    params = params or {}
-    params["limit"] = limit
-    params["in_feed"] = False
-    
-    with formatter.create_progress(f"Fetching rules from {instance_name}...") as (progress, task):
-        # Continue fetching until we have all rules
-        while True:
-            # Update offset for pagination
-            page_params = params.copy()
-            page_params["offset"] = offset
-            
-            # Fetch a page of rules
-            page = client.get("/v1/rules", params=page_params)
-            
-            # Extract rules from the response
-            if "rules" in page:
-                page_rules = page.get("rules", [])
-                count = page.get("count", 0)
-                total_rules = page.get("total", 0)
-            else:
-                page_rules = page
-                count = len(page_rules)
-                total_rules = count
-            
-            # Add rules to our collection
-            all_rules.extend(page_rules)
-            
-            # Update progress if we know the total
-            if total_rules and task:
-                progress.update(task, total=total_rules, completed=len(all_rules))
-            
-            # Check if we've fetched all rules
-            if len(all_rules) >= total_rules or len(page_rules) == 0:
-                break
-            
-            # Update offset for next page
-            offset += limit
-    
-    return all_rules
-
-
-def filter_rules_by_id(rules: List[Dict], include_ids: Optional[str], exclude_ids: Optional[str]) -> List[Dict]:
-    """Filter rules based on ID.
-    
-    Args:
-        rules: List of rule objects
-        include_ids: Comma-separated list of rule IDs to include
-        exclude_ids: Comma-separated list of rule IDs to exclude
-        
-    Returns:
-        List[Dict]: Filtered rule objects
-    """
-    filtered = rules
-    
-    # Filter by IDs
-    if include_ids:
-        ids = [id.strip() for id in include_ids.split(",")]
-        filtered = [rule for rule in filtered if rule.get("id") in ids]
-        
-    if exclude_ids:
-        ids = [id.strip() for id in exclude_ids.split(",")]
-        filtered = [rule for rule in filtered if rule.get("id") not in ids]
-    
-    return filtered
+        sublime_error = handle_api_error(e)
+        if isinstance(sublime_error, ApiError):
+            return CommandResult.error(f"API error during migration: {sublime_error.message}", sublime_error.details)
+        else:
+            return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
 def match_rules_and_categorize(source_rules: List[Dict], dest_rules: List[Dict]) -> Dict:
@@ -309,16 +248,16 @@ def perform_migration(formatter, dest_client, new_rules: List[Dict],
     # Process new rules
     if new_rules:
         with formatter.create_progress("Creating new rules...", total=len(new_rules)) as (progress, task):
-            for rule in new_rules:
+            for i, rule in enumerate(new_rules):
                 process_new_rule(rule, dest_client, results)
-                progress.update(task, advance=1)
+                progress.update(task, completed=i+1)
     
     # Process updates
     if update_rules:
         with formatter.create_progress("Updating existing rules...", total=len(update_rules)) as (progress, task):
-            for rule in update_rules:
+            for i, rule in enumerate(update_rules):
                 process_update_rule(rule, dest_client, existing_map, results)
-                progress.update(task, advance=1)
+                progress.update(task, completed=i+1)
     
     return results
 
@@ -339,13 +278,22 @@ def process_new_rule(rule: Dict, dest_client, results: Dict):
             "status": "created"
         })
         
-    except Exception as e:
+    except ApiError as e:
         results["failed"] += 1
         results["details"].append({
             "name": rule_name,
             "type": rule.get("type", ""),
             "status": "failed",
-            "reason": str(e)
+            "reason": e.message
+        })
+    except Exception as e:
+        sublime_error = handle_api_error(e)
+        results["failed"] += 1
+        results["details"].append({
+            "name": rule_name,
+            "type": rule.get("type", ""),
+            "status": "failed",
+            "reason": str(sublime_error.message)
         })
 
 
@@ -377,13 +325,22 @@ def process_update_rule(rule: Dict, dest_client, existing_map: Dict[str, Dict], 
             "status": "updated"
         })
             
-    except Exception as e:
+    except ApiError as e:
         results["failed"] += 1
         results["details"].append({
             "name": rule_name,
             "type": rule.get("type", ""),
             "status": "failed",
-            "reason": str(e)
+            "reason": e.message
+        })
+    except Exception as e:
+        sublime_error = handle_api_error(e)
+        results["failed"] += 1
+        results["details"].append({
+            "name": rule_name,
+            "type": rule.get("type", ""),
+            "status": "failed",
+            "reason": str(sublime_error.message)
         })
 
 

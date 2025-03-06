@@ -538,6 +538,8 @@ class InteractiveFormatter(OutputFormatter):
         table.add_column(col2_title, style="blue")
         table.add_column("Status", style="cyan")
         
+        ##### the rule name display issue w/ rule_exclusions is somewhere here
+        ##### tip: rules works well, compare the json outputs
         for rule in rules_to_update:
             details = ""
             if is_actions:
@@ -545,8 +547,10 @@ class InteractiveFormatter(OutputFormatter):
             elif is_exclusions:
                 details = "\n".join(rule.get("exclusions", []))
             
+            rule_name = rule.get("rule_name", rule.get("name", ""))
+        
             table.add_row(
-                rule.get("rule_name", ""),
+                rule_name,
                 details,
                 rule.get("status", "")
             )
