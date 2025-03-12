@@ -1,4 +1,4 @@
-"""Refactored commands for migrating rule exclusions using utility functions."""
+"""Migration command for applying rule-level exclusions."""
 from typing import Dict, List, Optional, Set, Tuple
 import re
 import click
@@ -53,104 +53,80 @@ def migrate_rule_exclusions_between_instances(
             dest_client = get_api_client_from_env_or_args(dest_api_key, dest_region, destination=True)
             progress.update(task, advance=1)
             
-        # Use PaginatedFetcher to fetch all rules from source
+        # Fetch rule exclusions directly from source
+        params = {"scope": "rule_exclusion"}
         source_fetcher = PaginatedFetcher(source_client, formatter)
-        source_rules = source_fetcher.fetch_all(
-            "/v1/rules",
-            progress_message="Fetching rules from source..."
+        source_exclusions = source_fetcher.fetch_all(
+            "/v1/exclusions",
+            params=params,
+            progress_message="Fetching rule exclusions from source...",
         )
         
-        # Apply rule ID filters using our utility function
-        filtered_rules = filter_by_ids(source_rules, include_rule_ids, exclude_rule_ids)
-        
-        # Fetch detailed rule information including exclusions
-        with formatter.create_progress("Fetching rule details for exclusions...", total=len(filtered_rules)) as (progress, task):
-            detailed_rules = []
+        if not source_exclusions:
+            return CommandResult.error("No rule exclusions found in source instance.")
             
-            for i, rule in enumerate(filtered_rules):
-                try:
-                    rule_id = rule.get("id")
-                    # Fetch detailed info
-                    details = source_client.get(f"/v1/rules/{rule_id}")
-                    detailed_rules.append(details)
-                except ApiError as e:
-                    formatter.output_error(f"Warning: Failed to fetch details for rule '{rule.get('name')}': {e.message}")
-                except Exception as e:
-                    sublime_error = handle_api_error(e)
-                    formatter.output_error(f"Warning: Failed to fetch details for rule '{rule.get('name')}': {sublime_error.message}")
+        # Apply filters if rule IDs were specified
+        if include_rule_ids or exclude_rule_ids:
+            source_exclusions = filter_rule_exclusions_by_rule_ids(
+                source_exclusions, include_rule_ids, exclude_rule_ids
+            )
+            
+            if not source_exclusions:
+                return CommandResult.error("No rule exclusions match the specified rule ID filters.")
                 
-                # Update progress
-                progress.update(task, completed=i+1)
-        
-        # Filter to only rules with exclusions
-        rules_with_exclusions = [
-            rule for rule in detailed_rules 
-            if rule.get("exclusions") and len(rule.get("exclusions")) > 0
-        ]
-        
-        if not rules_with_exclusions:
-            return CommandResult.error("No rules with exclusions found after applying filters.")
-            
-        # Use PaginatedFetcher to fetch all rules from destination
+        # Fetch all rules from destination to build match map
         dest_fetcher = PaginatedFetcher(dest_client, formatter)
         dest_rules = dest_fetcher.fetch_all(
             "/v1/rules",
             progress_message="Fetching rules from destination..."
         )
         
-        # Create mapping of rules by name and md5 in destination
+        # Create mapping of destination rules by name and source_md5
         dest_rules_map = {
             (rule.get("name"), rule.get("source_md5")): rule 
             for rule in dest_rules
         }
         
-        # Match rules and parse exclusions
-        matching_results = match_rules_and_parse_exclusions(
-            rules_with_exclusions, dest_rules_map
+        # Match rule exclusions to destination rules
+        matching_results = match_exclusions_to_rules(
+            source_exclusions, dest_rules_map
         )
         
-        rules_to_update = matching_results["rules_to_update"]
-        skipped_rules = matching_results["skipped_rules"]
+        exclusions_to_apply = matching_results["exclusions_to_apply"]
         skipped_exclusions = matching_results["skipped_exclusions"]
         
-        # If no rules to update, return early
-        if not rules_to_update:
+        # If no exclusions to apply, return early
+        if not exclusions_to_apply:
             return CommandResult.error(
                 "No rule exclusions can be migrated (all were skipped).",
-                {
-                    "skipped_rules": len(skipped_rules),
-                    "skipped_exclusions": len(skipped_exclusions)
-                }
+                {"skipped_exclusions": len(skipped_exclusions)}
             )
             
         # Prepare response data
-        total_exclusions = sum(len(rule["parsed_exclusions"]) for rule in rules_to_update)
-        
-        migration_data = {
-            "rules_to_update": [
-                {
-                    "rule_name": rule["source_rule"].get("name", ""),
-                    "rule_id": rule["dest_rule"].get("id", ""),
-                    "exclusions": [
-                        f"{next(iter(exc.keys()))}: {next(iter(exc.values()))}"
-                        for exc in rule["parsed_exclusions"]
-                    ],
+        total_exclusions = len(exclusions_to_apply)
+        # Group exclusions by rule
+        exclusions_by_rule = {}
+        for exclusion in exclusions_to_apply:
+            rule_id = exclusion["dest_rule"]["id"]
+            rule_name = exclusion["dest_rule"]["name"]
+            if rule_id not in exclusions_by_rule:
+                exclusions_by_rule[rule_id] = {
+                    "rule_name": rule_name,
+                    "rule_id": rule_id,
+                    "exclusions": [],
                     "status": "Update"
                 }
-                for rule in rules_to_update
-            ],
-            "skipped_rules": [
-                {
-                    "rule_name": item["rule"].get("name", ""),
-                    "reason": item["reason"]
-                }
-                for item in skipped_rules
-            ],
+            exclusions_by_rule[rule_id]["exclusions"].append(
+                f"{exclusion['exclusion_type']}: {exclusion['exclusion_value']}"
+            )
+        
+        migration_data = {
+            "rules_to_update": list(exclusions_by_rule.values()),
             "skipped_exclusions": [
                 {
-                    "rule_name": item["rule"].get("name", ""),
-                    "exclusion": item["exclusion"],
-                    "reason": item["reason"]
+                    "rule_name": item.get("originating_rule", {}).get("name", "Unknown"),
+                    "exclusion": item.get("source", ""),
+                    "reason": item.get("reason", "Unknown reason")
                 }
                 for item in skipped_exclusions
             ]
@@ -158,11 +134,10 @@ def migrate_rule_exclusions_between_instances(
         
         # Add summary stats
         migration_data["summary"] = {
-            "rules_count": len(rules_to_update),
+            "rules_count": len(exclusions_by_rule),
             "exclusions_count": total_exclusions,
-            "skipped_rules_count": len(skipped_rules),
             "skipped_exclusions_count": len(skipped_exclusions),
-            "total_count": len(rules_to_update) + len(skipped_rules)
+            "total_count": total_exclusions + len(skipped_exclusions)
         }
         
         # If dry run, return preview data
@@ -185,7 +160,7 @@ def migrate_rule_exclusions_between_instances(
             return CommandResult.success("Migration canceled by user.")
         
         # Perform the migration
-        results = apply_rule_exclusions(formatter, dest_client, rules_to_update)
+        results = apply_rule_exclusions(formatter, dest_client, exclusions_to_apply)
         
         # Add results to migration data
         migration_data["results"] = results
@@ -206,88 +181,128 @@ def migrate_rule_exclusions_between_instances(
             return CommandResult.error(f"Error during migration: {sublime_error.message}")
 
 
-def match_rules_and_parse_exclusions(source_rules: List[Dict], dest_rules_map: Dict) -> Dict:
-    """Match rules between source and destination and parse exclusions.
+def filter_rule_exclusions_by_rule_ids(exclusions: List[Dict], include_rule_ids: Optional[str], exclude_rule_ids: Optional[str]) -> List[Dict]:
+    """Filter rule exclusions based on rule IDs.
     
     Args:
-        source_rules: List of source rules with exclusions
+        exclusions: List of rule exclusion objects
+        include_rule_ids: Comma-separated list of rule IDs to include
+        exclude_rule_ids: Comma-separated list of rule IDs to exclude
+        
+    Returns:
+        List[Dict]: Filtered rule exclusions
+    """
+    # Convert rule ID strings to sets
+    include_ids = set(id.strip() for id in include_rule_ids.split(",")) if include_rule_ids else None
+    exclude_ids = set(id.strip() for id in exclude_rule_ids.split(",")) if exclude_rule_ids else None
+    
+    filtered_exclusions = []
+    
+    for exclusion in exclusions:
+        if not exclusion.get("originating_rule"):
+            # Skip if no originating rule
+            continue
+            
+        rule_id = exclusion["originating_rule"].get("id")
+        
+        # Apply filters
+        if include_ids and rule_id not in include_ids:
+            continue
+            
+        if exclude_ids and rule_id in exclude_ids:
+            continue
+            
+        filtered_exclusions.append(exclusion)
+    
+    return filtered_exclusions
+
+
+def match_exclusions_to_rules(source_exclusions: List[Dict], dest_rules_map: Dict) -> Dict:
+    """Match rule exclusions to destination rules.
+    
+    Args:
+        source_exclusions: List of source rule exclusions
         dest_rules_map: Map of destination rules by (name, source_md5)
         
     Returns:
-        Dict: Results of matching including rules to update and skipped items
+        Dict: Results of matching
     """
-    rules_to_update = []
-    skipped_rules = []
+    exclusions_to_apply = []
     skipped_exclusions = []
     
-    for source_rule in source_rules:
-        rule_name = source_rule.get("name")
-        rule_md5 = source_rule.get("source_md5")
+    for exclusion in source_exclusions:
+        # Get originating rule details
+        originating_rule = exclusion.get("originating_rule")
+        
+        if not originating_rule:
+            skipped_exclusions.append({
+                **exclusion,
+                "reason": "No originating rule information found"
+            })
+            continue
+            
+        rule_name = originating_rule.get("name")
+        rule_md5 = originating_rule.get("source_md5")
         
         # Find matching rule in destination
         dest_rule = dest_rules_map.get((rule_name, rule_md5))
         
         if not dest_rule:
-            # Rule not found in destination or has different content
-            skipped_rules.append({
-                "rule": source_rule,
+            skipped_exclusions.append({
+                **exclusion,
                 "reason": "No matching rule found in destination (name and source_md5 must match)"
             })
             continue
+            
+        # Parse exclusion
+        source_text = exclusion.get("source", "")
+        parsed_exclusion = parse_exclusion_string(source_text)
         
-        # Parse exclusions
-        parsed_exclusions = []
-        
-        for exclusion_str in source_rule.get("exclusions", []):
-            exclusion = parse_exclusion_string(exclusion_str)
-            if exclusion:
-                parsed_exclusions.append(exclusion)
-            else:
-                skipped_exclusions.append({
-                    "rule": source_rule,
-                    "exclusion": exclusion_str,
-                    "reason": "Could not parse exclusion format"
-                })
-        
-        # Only include rule if it has parsed exclusions
-        if parsed_exclusions:
-            rules_to_update.append({
-                "source_rule": source_rule,
-                "dest_rule": dest_rule,
-                "parsed_exclusions": parsed_exclusions
+        if not parsed_exclusion:
+            skipped_exclusions.append({
+                **exclusion,
+                "reason": "Could not parse exclusion format"
             })
+            continue
+            
+        # Add to list of exclusions to apply
+        exclusions_to_apply.append({
+            "source_exclusion": exclusion,
+            "dest_rule": dest_rule,
+            "exclusion_type": parsed_exclusion[0],
+            "exclusion_value": parsed_exclusion[1]
+        })
     
     return {
-        "rules_to_update": rules_to_update,
-        "skipped_rules": skipped_rules,
+        "exclusions_to_apply": exclusions_to_apply,
         "skipped_exclusions": skipped_exclusions
     }
 
 
-def parse_exclusion_string(exclusion_str: str) -> Optional[Dict]:
+def parse_exclusion_string(exclusion_str: str) -> Optional[Tuple[str, str]]:
     """Parse an exclusion string to determine its type.
     
     Args:
         exclusion_str: Exclusion string from the rule
         
     Returns:
-        Optional[Dict]: Exclusion payload or None if not recognized
+        Optional[Tuple[str, str]]: Exclusion type and value, or None if not recognized
     """
     for exc_type, pattern in EXCLUSION_PATTERNS.items():
         match = pattern.search(exclusion_str)
         if match:
-            return {exc_type: match.group(1)}
+            return (exc_type, match.group(1))
     
     return None
 
 
-def apply_rule_exclusions(formatter, dest_client, rules_to_update: List[Dict]) -> Dict:
+def apply_rule_exclusions(formatter, dest_client, exclusions_to_apply: List[Dict]) -> Dict:
     """Apply exclusions to rules in the destination.
     
     Args:
         formatter: Output formatter
         dest_client: API client for the destination
-        rules_to_update: List of rules to update with parsed exclusions
+        exclusions_to_apply: List of exclusions to apply with rule information
         
     Returns:
         Dict: Migration results
@@ -299,25 +314,44 @@ def apply_rule_exclusions(formatter, dest_client, rules_to_update: List[Dict]) -
         "details": []
     }
     
-    with formatter.create_progress("Updating rule exclusions...", total=len(rules_to_update)) as (progress, task):
-        for i, rule_update in enumerate(rules_to_update):
-            process_rule_exclusion_update(rule_update, dest_client, results)
-            progress.update(task, completed=i+1)
+    # Group exclusions by rule for efficient updates
+    exclusions_by_rule = {}
+    for exclusion in exclusions_to_apply:
+        rule_id = exclusion["dest_rule"]["id"]
+        if rule_id not in exclusions_by_rule:
+            exclusions_by_rule[rule_id] = {
+                "rule": exclusion["dest_rule"],
+                "exclusions": []
+            }
+        exclusions_by_rule[rule_id]["exclusions"].append({
+            exclusion["exclusion_type"]: exclusion["exclusion_value"]
+        })
+    
+    with formatter.create_progress("Updating rule exclusions...", total=len(exclusions_by_rule)) as (progress, task):
+        for i, (rule_id, rule_data) in enumerate(exclusions_by_rule.items()):
+            rule = rule_data["rule"]
+            exclusions = rule_data["exclusions"]
+            
+            process_rule_exclusion_update(rule, exclusions, dest_client, results)
+            
+            # Update progress
+            if progress and task:
+                progress.update(task, completed=i+1)
     
     return results
 
 
-def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict):
-    """Process a rule exclusion update.
+def process_rule_exclusion_update(rule: Dict, exclusions: List[Dict], dest_client, results: Dict):
+    """Process rule exclusion updates for a single rule.
     
     Args:
-        rule_update: Rule update information with parsed exclusions
+        rule: Rule to update
+        exclusions: List of exclusions to apply to the rule
         dest_client: API client for the destination
         results: Results dictionary to update
     """
-    rule_name = rule_update["source_rule"].get("name", "")
-    dest_rule_id = rule_update["dest_rule"].get("id", "")
-    exclusions = rule_update["parsed_exclusions"]
+    rule_name = rule.get("name", "")
+    rule_id = rule.get("id", "")
     
     try:
         # Apply each exclusion one by one
@@ -325,7 +359,7 @@ def process_rule_exclusion_update(rule_update: Dict, dest_client, results: Dict)
         for exclusion in exclusions:
             try:
                 # Add exclusion to rule
-                dest_client.post(f"/v1/rules/{dest_rule_id}/add-exclusion", exclusion)
+                dest_client.post(f"/v1/rules/{rule_id}/add-exclusion", exclusion)
                 succeeded += 1
             except ApiError as e:
                 # Record failure but continue with others

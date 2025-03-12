@@ -482,10 +482,14 @@ class InteractiveFormatter(OutputFormatter):
         elif migration_type == "rules":
             table.add_column("Type", style="blue")
             table.add_column("Severity", style="magenta")
+        elif migration_type == "rule-exclusions":
+            table.add_column("Exclusions", style="blue")
         
         # Add rows based on migration type
         for item in items:
-            row_data = [item.get("name", ""), item.get("status", "")]
+            
+            item_name = item.get("rule_name", item.get("name", ""))
+            row_data = [item_name, item.get("status", "")]
             
             if migration_type == "actions":
                 row_data.append(item.get("type", ""))
@@ -503,6 +507,14 @@ class InteractiveFormatter(OutputFormatter):
             elif migration_type == "rules":
                 row_data.append(item.get("type", ""))
                 row_data.append(item.get("severity", ""))
+            elif migration_type == "rule-exclusions":
+                # Format exclusions count or list for rule-exclusions
+                exclusions = item.get("exclusions", [])
+                if isinstance(exclusions, list):
+                    exclusions_count = len(exclusions)
+                    row_data.append(f"{exclusions_count} exclusions")
+                else:
+                    row_data.append(str(exclusions))
             
             table.add_row(*row_data)
         
