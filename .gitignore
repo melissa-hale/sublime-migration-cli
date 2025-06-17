@@ -38,3 +38,6 @@ htmlcov/
 *.swp
 *.swo
 .DS_Store
+
+commands
+sublime-export/
